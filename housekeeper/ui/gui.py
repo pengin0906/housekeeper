@@ -643,7 +643,7 @@ class HousekeeperGui:
             else:
                 self._peak_disk_bps = max(self._peak_disk_bps * 0.95, cur_disk_peak, 1_000.0)
             disk_scale = self._peak_disk_bps * 1.2  # 20% headroom
-            summary = f"R:{_fmt_bytes_sec(total_r)} W:{_fmt_bytes_sec(total_w)}"
+            summary = f"R:{_fmt_bytes_sec(total_r)} W:{_fmt_bytes_sec(total_w)} [{_fmt_bytes_sec(disk_scale)}]"
             y = self._draw_section_header(y, "disk", f"Disk I/O ({len(disk_data)} devs)", summary)
             if self.expanded["disk"]:
                 show_raid = self.expanded.get("raid_members", False)
@@ -709,7 +709,7 @@ class HousekeeperGui:
             else:
                 self._peak_nfs_bps = max(self._peak_nfs_bps * 0.95, cur_nfs_peak, 1_000.0)
             nfs_scale = self._peak_nfs_bps * 1.2
-            summary = f"{len(nfs_data)} mounts"
+            summary = f"{len(nfs_data)} mounts [{_fmt_bytes_sec(nfs_scale)}]"
             y = self._draw_section_header(y, "nfs", "NFS/SAN/NAS", summary)
             if self.expanded["nfs"]:
                 for mt in nfs_data:
@@ -730,7 +730,7 @@ class HousekeeperGui:
                 else:
                     self._peak_pcie_bps = max(self._peak_pcie_bps * 0.95, cur_pcie_peak, 1_000.0)
             pcie_scale = self._peak_pcie_bps * 1.2
-            summary = f"{len(pcie_data)} devices"
+            summary = f"{len(pcie_data)} devices [{_fmt_bytes_sec(pcie_scale)}]"
             y = self._draw_section_header(y, "pcie", "PCIe Devices", summary)
             if self.expanded["pcie"]:
                 for d in pcie_data:

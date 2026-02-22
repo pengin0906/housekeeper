@@ -314,8 +314,6 @@ class Renderer:
         label_w: int, val_w: int, disks: list[DiskUsage],
     ) -> int:
         max_y, _ = win.getmaxyx()
-        draw_section_header(win, y, x, width, "Disk I/O", PAIR_HEADER)
-        y += 1
 
         # 自動スケール
         cur_peak = max(max((d.read_bytes_sec for d in disks), default=0),
@@ -325,6 +323,9 @@ class Renderer:
         else:
             self._peak_disk_bps = max(self._peak_disk_bps * 0.95, cur_peak, 1_000.0)
         disk_scale = self._peak_disk_bps * 1.2
+        draw_section_header(win, y, x, width,
+                            f"Disk I/O [{_fmt_bytes_sec(disk_scale)}]", PAIR_HEADER)
+        y += 1
 
         for d in disks:
             if y >= max_y - 1:
@@ -361,8 +362,6 @@ class Renderer:
         label_w: int, val_w: int, networks: list[NetUsage],
     ) -> int:
         max_y, _ = win.getmaxyx()
-        draw_section_header(win, y, x, width, "Network", PAIR_HEADER)
-        y += 1
 
         # 自動スケール
         cur_peak = max(max((n.rx_bytes_sec for n in networks), default=0),
@@ -372,6 +371,9 @@ class Renderer:
         else:
             self._peak_net_bps = max(self._peak_net_bps * 0.95, cur_peak, 1_000.0)
         net_scale = self._peak_net_bps * 1.2
+        draw_section_header(win, y, x, width,
+                            f"Network [{_fmt_bytes_sec(net_scale)}]", PAIR_HEADER)
+        y += 1
 
         for n in networks:
             if y >= max_y - 1:
@@ -409,8 +411,6 @@ class Renderer:
         label_w: int, val_w: int, mounts: list[NfsMountUsage],
     ) -> int:
         max_y, _ = win.getmaxyx()
-        draw_section_header(win, y, x, width, "NFS/SAN/NAS", PAIR_HEADER)
-        y += 1
 
         # 自動スケール
         cur_peak = max(max((m.read_bytes_sec for m in mounts), default=0),
@@ -420,6 +420,9 @@ class Renderer:
         else:
             self._peak_nfs_bps = max(self._peak_nfs_bps * 0.95, cur_peak, 1_000.0)
         nfs_scale = self._peak_nfs_bps * 1.2
+        draw_section_header(win, y, x, width,
+                            f"NFS/SAN/NAS [{_fmt_bytes_sec(nfs_scale)}]", PAIR_HEADER)
+        y += 1
 
         for m in mounts:
             if y >= max_y - 1:
@@ -547,8 +550,6 @@ class Renderer:
         label_w: int, val_w: int, devices: list[PcieDeviceInfo],
     ) -> int:
         max_y, _ = win.getmaxyx()
-        draw_section_header(win, y, x, width, "PCIe Devices", PAIR_HEADER)
-        y += 1
 
         # 自動スケール (I/Oデータがあるデバイスのみ)
         io_devs = [d for d in devices if d.io_label]
@@ -560,6 +561,9 @@ class Renderer:
             else:
                 self._peak_pcie_bps = max(self._peak_pcie_bps * 0.95, cur_peak, 1_000.0)
         pcie_scale = self._peak_pcie_bps * 1.2
+        draw_section_header(win, y, x, width,
+                            f"PCIe Devices [{_fmt_bytes_sec(pcie_scale)}]", PAIR_HEADER)
+        y += 1
 
         for dev in devices:
             if y >= max_y - 1:
