@@ -61,9 +61,70 @@ _IS_WIN = sys.platform == "win32"
 _VIRTUAL_PREFIXES = ("docker", "veth", "br-", "virbr", "lxc", "flannel",
                      "cni", "calico", "tun", "tap")
 
+# macOS: 表示不要な仮想/システムインターフェース
+_DARWIN_SKIP_PREFIXES = (
+    "utun",    # VPN / iCloud Private Relay トンネル
+    "awdl",    # AirDrop Wireless Direct Link
+    "llw",     # Low Latency WLAN
+    "anpi",    # Apple 内部
+    "bridge",  # Thunderbolt ブリッジ
+    "gif",     # IPv6 トンネル
+    "stf",     # 6to4 トンネル
+    "ap",      # アクセスポイント
+    "pktap",   # Packet tap
+    "ipsec",   # IPsec
+    "XHC",     # USB Host Controller
+    "vmnet",   # VMware
+)
+
+
+def _classify_darwin() -> dict[str, NetType]:
+    """macOS: インターフェースを WAN/LAN に分類。"""
+    classification: dict[str, NetType] = {}
+    try:
+        # デフォルトルート (WAN) のインターフェースを取得
+        out = subprocess.run(
+            ["route", "-n", "get", "default"],
+            capture_output=True, text=True, timeout=3,
+        )
+        default_iface = ""
+        if out.returncode == 0:
+            for line in out.stdout.splitlines():
+                if "interface:" in line:
+                    default_iface = line.split(":")[-1].strip()
+                    break
+        # netstat -ib で存在するインターフェースを列挙
+        out2 = subprocess.run(
+            ["netstat", "-ib"],
+            capture_output=True, text=True, timeout=3,
+        )
+        if out2.returncode == 0:
+            seen: set[str] = set()
+            for line in out2.stdout.splitlines()[1:]:
+                parts = line.split()
+                if not parts:
+                    continue
+                iface = parts[0]
+                if iface in seen or iface.startswith("lo"):
+                    continue
+                if any(iface.startswith(p) for p in _DARWIN_SKIP_PREFIXES):
+                    continue
+                seen.add(iface)
+                if iface == default_iface:
+                    classification[iface] = NetType.WAN
+                elif iface.startswith("en"):
+                    classification[iface] = NetType.LAN
+                else:
+                    classification[iface] = NetType.UNKNOWN
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return classification
+
 
 def _classify_interfaces() -> dict[str, NetType]:
-    if _IS_DARWIN or _IS_WIN:
+    if _IS_DARWIN:
+        return _classify_darwin()
+    if _IS_WIN:
         return {}
 
     classification: dict[str, NetType] = {}
@@ -197,9 +258,15 @@ class NetworkCollector:
                 iface = parts[0]
                 if iface.startswith("lo"):
                     continue
+                # macOS 仮想/システムインターフェースをスキップ
+                if any(iface.startswith(p) for p in _DARWIN_SKIP_PREFIXES):
+                    continue
                 try:
                     ibytes = int(parts[6])
                     obytes = int(parts[9])
+                    # トラフィックゼロのインターフェースをスキップ
+                    if ibytes == 0 and obytes == 0:
+                        continue
                     if iface in result:
                         if ibytes > result[iface].rx_bytes:
                             result[iface] = NetStats(name=iface, rx_bytes=ibytes, tx_bytes=obytes)

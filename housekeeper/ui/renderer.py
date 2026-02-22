@@ -838,10 +838,28 @@ class Renderer:
         draw_section_header(win, y, x, width, "Top Processes", PAIR_HEADER)
         y += 1
 
+        # テーブルヘッダー
+        name_w = max(20, width - 30)
+        header = f" {'PID':>7s}  {'COMMAND':<{name_w}s} {'CPU%':>6s} {'MEM':>8s}"
+        try:
+            win.addnstr(y, x, header[:width], width,
+                         curses.color_pair(PAIR_HEADER))
+        except curses.error:
+            pass
+        y += 1
+
         for p in procs:
             if y >= max_y - 1:
                 break
-            line = f" {p.pid:>7d}  {p.name:<20s} CPU:{p.cpu_pct:5.1f}%  MEM:{p.mem_rss_mib:7.1f}M"
+            display_name = p.name
+            if p.cmdline and p.cmdline != p.name:
+                cmd_parts = p.cmdline.split()
+                if len(cmd_parts) > 1:
+                    args = " ".join(cmd_parts[1:])
+                    display_name = f"{p.name} {args}"
+            if len(display_name) > name_w:
+                display_name = display_name[:name_w - 3] + "..."
+            line = f" {p.pid:>7d}  {display_name:<{name_w}s} {p.cpu_pct:5.1f}% {p.mem_rss_mib:7.1f}M"
             color = PAIR_USER if p.cpu_pct > 50 else PAIR_LABEL
             try:
                 win.addnstr(y, x, line[:width], width,

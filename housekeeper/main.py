@@ -367,6 +367,14 @@ def main() -> None:
         help="Launch X11 GUI window (tkinter) [default]",
     )
     parser.add_argument(
+        "-f", "--full", action="store_true",
+        help="Start in full (non-summary) mode",
+    )
+    parser.add_argument(
+        "--profile", action="store_true",
+        help="Show profiling info (frame time, collector costs)",
+    )
+    parser.add_argument(
         "--detect", action="store_true",
         help="Detect available hardware and exit",
     )

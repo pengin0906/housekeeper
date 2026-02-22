@@ -13,11 +13,21 @@ from __future__ import annotations
 import argparse
 import importlib
 import shutil
+import sys
 import time
 import tkinter as tk
 from collections import deque
 from pathlib import Path
 from typing import Any
+
+# macOS の tkinter は "monospace" を .AppleSystemUIFont (プロポーショナル) に
+# 解決するため、プラットフォーム別に正しい等幅フォントを指定する
+if sys.platform == "darwin":
+    _MONO = "Menlo"
+elif sys.platform == "win32":
+    _MONO = "Consolas"
+else:
+    _MONO = "monospace"
 
 
 # ─── OCCT 風カラーパレット ────────────────────────────────
@@ -216,7 +226,7 @@ class HousekeeperGui:
         self._bar_desc: dict[str, str] = {}  # line_key → 説明テキスト
         self._tooltip_text: str = ""  # 右クリックツールチップ
         self._tooltip_pos: tuple[int, int] = (0, 0)
-        self._summary_mode: bool = True  # サマリーモード (各セクション1行)
+        self._summary_mode: bool = not getattr(args, "full", False)  # --full でフルモード起動
         self._summary_expanded: set[str] = set()  # サマリーモードで展開中のセクション
         self._summary_click_zones: list[tuple[int, int, str]] = []  # (y1, y2, section)
         self._current_section: str = ""  # 描画中のセクションキー
@@ -225,6 +235,7 @@ class HousekeeperGui:
         # プロファイリング: 各コレクター・描画の所要時間 (ms)
         self._prof: dict[str, float] = {}
         self._prof_total: float = 0.0
+        self._show_profile: bool = getattr(args, "profile", False)
 
         # 自動スケール用ピーク値 (減衰付き)
         self._peak_net_bps: float = 1_000.0    # 最低 1KB/s
@@ -530,7 +541,7 @@ class HousekeeperGui:
         text_y = by + 10
         for line in lines:
             c.create_text(bx + 10, text_y, anchor="nw", text=line,
-                          fill=COLORS["fg_data"], font=("monospace", 9))
+                          fill=COLORS["fg_data"], font=(_MONO, 9))
             text_y += 16
 
     def _on_scroll(self, event: Any) -> None:
@@ -670,10 +681,10 @@ class HousekeeperGui:
         section_icon = ICONS.get(key, "")
         header_text = f"{fold_icon} {section_icon} {title}" if section_icon else f"{fold_icon} {title}"
         c.create_text(x_cursor, y + h // 2, anchor="w", text=header_text,
-                      fill=COLORS["fg_data"], font=("monospace", 11, "bold"))
+                      fill=COLORS["fg_data"], font=(_MONO, 11, "bold"))
         if summary:
             c.create_text(c_width - 10, y + h // 2, anchor="e", text=summary,
-                          fill=COLORS["text_dim"], font=("monospace", 9))
+                          fill=COLORS["text_dim"], font=(_MONO, 9))
 
         # 下ライン
         c.create_line(0, y + h - 1, c_width, y + h - 1,
@@ -749,7 +760,7 @@ class HousekeeperGui:
 
         # Label (オレンジ)
         c.create_text(x, y + h // 2, anchor="w", text=label,
-                      fill=COLORS["fg"], font=("monospace", 10, "bold"))
+                      fill=COLORS["fg"], font=(_MONO, 10, "bold"))
         x += lw
 
         # Bar 背景 + ボーダー
@@ -768,7 +779,7 @@ class HousekeeperGui:
 
         # 値テキスト
         c.create_text(x + bw + 10, y + h // 2, anchor="w", text=value,
-                      fill=COLORS["fg_data"], font=("monospace", 9))
+                      fill=COLORS["fg_data"], font=(_MONO, 9))
 
         # バーゾーン記録 (個別クリック用)
         end_y = y + h + 2
@@ -789,7 +800,7 @@ class HousekeeperGui:
         if end_y >= self._view_top and y <= self._view_bot:
             color = color or COLORS["text_dim"]
             self.canvas.create_text(15, y + 8, anchor="w", text=text,
-                                    fill=color, font=("monospace", 9))
+                                    fill=color, font=(_MONO, 9))
         if hide_key:
             self._bar_zones.append((y, end_y, hide_key))
         return end_y
@@ -819,7 +830,7 @@ class HousekeeperGui:
 
         # ラベル
         c.create_text(x_offset, gy + gh // 2, anchor="w", text=label,
-                      fill=COLORS["fg"], font=("monospace", 10, "bold"))
+                      fill=COLORS["fg"], font=(_MONO, 10, "bold"))
 
         # グラフ背景
         c.create_rectangle(gx, gy, gx + gw, gy + gh,
@@ -858,10 +869,10 @@ class HousekeeperGui:
             min_lbl = fmt_fn(min_val) if fmt_fn else f"{min_val:.0f}"
             c.create_text(gx + gw + 4, gy, anchor="nw",
                           text=max_lbl, fill=COLORS["text_dim"],
-                          font=("monospace", 7))
+                          font=(_MONO, 7))
             c.create_text(gx + gw + 4, gy + gh, anchor="sw",
                           text=min_lbl, fill=COLORS["text_dim"],
-                          font=("monospace", 7))
+                          font=(_MONO, 7))
 
         # グリッドライン (50%)
         mid_y = gy + gh * 0.5
@@ -901,7 +912,7 @@ class HousekeeperGui:
                 latest = self._history[hkey][-1]
                 val_text = fmt_fn(latest) if fmt_fn else fmt_val.format(latest)
                 c.create_text(vx, vy, anchor="nw", text=val_text,
-                              fill=color, font=("monospace", 9, "bold"))
+                              fill=color, font=(_MONO, 9, "bold"))
                 vy += 12
 
         return y + gh + 4
@@ -940,7 +951,7 @@ class HousekeeperGui:
 
         # ラベル (左端)
         c.create_text(4, y + h // 2, anchor="w", text=label,
-                      fill=COLORS["fg"], font=("monospace", font_sz, "bold"))
+                      fill=COLORS["fg"], font=(_MONO, font_sz, "bold"))
 
         # グラフ背景
         c.create_rectangle(gx, gy, gx + gw, gy + gh,
@@ -984,8 +995,8 @@ class HousekeeperGui:
 
         # 値 + 凡例 (グラフの左側に表示) — tkinter Font で実測
         import tkinter.font as tkfont
-        f_sm = tkfont.Font(family="monospace", size=font_sm, weight="bold")
-        f_lg = tkfont.Font(family="monospace", size=font_sz, weight="bold")
+        f_sm = tkfont.Font(family=_MONO, size=font_sm, weight="bold")
+        f_lg = tkfont.Font(family=_MONO, size=font_sz, weight="bold")
         line_h = f_sm.metrics("linespace") // 2 + 2
 
         def _measure(txt: str) -> int:
@@ -1170,7 +1181,7 @@ class HousekeeperGui:
         self.canvas.create_text(c_width // 2, title_h // 2,
                                 text=title_text,
                                 fill=COLORS["fg"],
-                                font=("monospace", 14, "bold"))
+                                font=(_MONO, 14, "bold"))
         # ? ヘルプボタン (右端)
         btn_w, btn_h = 28, 22
         btn_x = c_width - btn_w - 8
@@ -1179,7 +1190,7 @@ class HousekeeperGui:
                                      fill=COLORS["bar_bg"], outline=COLORS["fg"])
         self.canvas.create_text(btn_x + btn_w // 2, btn_y + btn_h // 2,
                                 text="?", fill=COLORS["fg"],
-                                font=("monospace", 12, "bold"))
+                                font=(_MONO, 12, "bold"))
         self._help_btn_zone = (btn_x, btn_y, btn_x + btn_w, btn_y + btn_h)
 
         self.canvas.create_line(0, title_h - 1, c_width, title_h - 1,
@@ -1377,7 +1388,7 @@ class HousekeeperGui:
                                fill="#440000" if oom_level == 3 else "#332200",
                                outline=oom_color)
             c.create_text(c_w // 2, y + 9, text=oom_msgs[oom_level],
-                          fill=oom_color, font=("monospace", 9, "bold"))
+                          fill=oom_color, font=(_MONO, 9, "bold"))
             y += 20
         elif oom_level == 1:
             y = self._draw_text(y,
@@ -2071,10 +2082,23 @@ class HousekeeperGui:
             summary = f"Top: {top_name} {top_cpu:.1f}%"
             y = self._draw_section_header(y, "proc", "Top Processes", summary)
             if self.expanded["proc"]:
+                # テーブルヘッダー
+                y = self._draw_text(y,
+                    f"{'PID':>8s}  {'COMMAND':<40s} {'CPU%':>6s} {'MEM':>8s}",
+                    COLORS["fg_sub"])
                 for p in proc_data:
                     color = COLORS["warn"] if p.cpu_pct > 50 else COLORS["text_dim"]
+                    # プロセス名+引数を結合して表示
+                    display_name = p.name
+                    if p.cmdline and p.cmdline != p.name:
+                        cmd_parts = p.cmdline.split()
+                        if len(cmd_parts) > 1:
+                            args = " ".join(cmd_parts[1:])
+                            display_name = f"{p.name} {args}"
+                    if len(display_name) > 40:
+                        display_name = display_name[:37] + "..."
                     y = self._draw_text(y,
-                        f"PID:{p.pid:>7d}  {p.name:<20s}  CPU:{p.cpu_pct:5.1f}%  MEM:{p.mem_rss_mib:7.1f}M",
+                        f"{p.pid:>8d}  {display_name:<40s} {p.cpu_pct:5.1f}% {p.mem_rss_mib:7.1f}M",
                         color)
 
         # ─── Footer ───────────────────────────────────────
@@ -2092,14 +2116,10 @@ class HousekeeperGui:
         self.canvas.create_text(
             c_width // 2, y + footer_h // 2,
             text="Bar icon: toggle line | Click bar: hide | Header icon: all line/reset | s:summary | f:C/F | +/-:interval | q:quit",
-            fill=COLORS["fg_sub"], font=("monospace", 9))
+            fill=COLORS["fg_sub"], font=(_MONO, 9))
         y += footer_h
 
-        # プロファイル表示
-        prof_h = 16
-        self.canvas.create_rectangle(0, y, c_width, y + prof_h,
-                                     fill=COLORS["bg"], outline="")
-        # 上位コスト順でコレクター時間を表示
+        # プロファイル: 常にログ出力、GUI表示は --profile フラグで制御
         sorted_prof = sorted(
             ((k, v) for k, v in self._prof.items() if not k.startswith("_")),
             key=lambda x: -x[1])
@@ -2108,16 +2128,21 @@ class HousekeeperGui:
                      f"(collect:{self._prof.get('_collect', 0):.0f} "
                      f"draw:{self._prof.get('_draw', 0):.0f}) "
                      + " ".join(parts))
-        # ログファイルに書き出し (毎秒)
+        # ログファイルに常時書き出し
         try:
             with open("/tmp/housekeeper_prof.log", "a") as f:
                 f.write(prof_text + "\n")
         except OSError:
             pass
-        self.canvas.create_text(
-            10, y + prof_h // 2, anchor="w", text=prof_text,
-            fill=COLORS["text_dim"], font=("monospace", 8))
-        y += prof_h + 5
+        # GUI 表示 (--profile)
+        if self._show_profile:
+            prof_h = 16
+            self.canvas.create_rectangle(0, y, c_width, y + prof_h,
+                                         fill=COLORS["bg"], outline="")
+            self.canvas.create_text(
+                10, y + prof_h // 2, anchor="w", text=prof_text,
+                fill=COLORS["text_dim"], font=(_MONO, 8))
+            y += prof_h + 5
 
         # ヘルプオーバーレイ
         if self._show_help:
@@ -2178,13 +2203,13 @@ class HousekeeperGui:
             if line.startswith("──"):
                 c.create_text(bx + box_w // 2, ty,
                               text=line, fill=COLORS["fg"],
-                              font=("monospace", 13, "bold"))
+                              font=(_MONO, 13, "bold"))
             elif line == "":
                 pass  # 空行
             elif line.startswith("Click anywhere"):
                 c.create_text(bx + box_w // 2, ty,
                               text=line, fill=COLORS["fg_sub"],
-                              font=("monospace", 9, "italic"))
+                              font=(_MONO, 9, "italic"))
             else:
                 # 左側 (操作) と右側 (説明) を分割
                 parts = line.split(None, 1)
@@ -2193,10 +2218,10 @@ class HousekeeperGui:
                 right = line[23:].strip()
                 c.create_text(bx + 20, ty, anchor="w",
                               text=left, fill=COLORS["fg"],
-                              font=("monospace", 11, "bold"))
+                              font=(_MONO, 11, "bold"))
                 c.create_text(bx + 210, ty, anchor="w",
                               text=right, fill=COLORS["fg_data"],
-                              font=("monospace", 11))
+                              font=(_MONO, 11))
             ty += line_h
 
     def run(self) -> None:

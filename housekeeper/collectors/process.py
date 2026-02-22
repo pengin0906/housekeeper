@@ -216,16 +216,20 @@ class ProcessCollector:
         return processes if self.top_n <= 0 else processes[:self.top_n]
 
     def _collect_darwin(self) -> list[ProcessInfo]:
-        """macOS: ps でプロセス情報を取得。"""
+        """macOS: ps でプロセス情報を取得 (フルコマンドライン付き)。"""
         processes: list[ProcessInfo] = []
         try:
+            # command= でフルコマンドライン (引数付き) を取得
             out = subprocess.run(
-                ["ps", "-eo", "pid,%cpu,rss,comm"],
+                ["ps", "-eo", "pid=,pcpu=,rss=,command="],
                 capture_output=True, text=True, timeout=3,
             )
             if out.returncode != 0:
                 return []
-            for line in out.stdout.splitlines()[1:]:
+            for line in out.stdout.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
                 parts = line.split(None, 3)
                 if len(parts) < 4:
                     continue
@@ -233,12 +237,13 @@ class ProcessCollector:
                     pid = int(parts[0])
                     cpu_pct = float(parts[1])
                     rss_kb = int(parts[2])
-                    comm = parts[3].strip()
-                    name = _get_friendly_name(comm, os.path.basename(comm))
+                    cmdline = parts[3].strip()
+                    comm = os.path.basename(cmdline.split()[0]) if cmdline else ""
+                    name = _get_friendly_name(cmdline, comm)
                     processes.append(ProcessInfo(
                         pid=pid,
                         name=name,
-                        cmdline=comm,
+                        cmdline=cmdline,
                         cpu_pct=cpu_pct,
                         mem_rss_kb=rss_kb,
                     ))

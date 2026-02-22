@@ -1,13 +1,14 @@
 """CPU usage collector.
 
 Linux: /proc/stat から累積 jiffies を読み取り、差分で使用率を計算。
-macOS: sysctl kern.cp_time (合計) + per-core は host_processor_info 相当を
-       top コマンドで取得。
+macOS: Mach host_processor_info() で per-core CPU ticks を直接取得 (ctypes)。
 Windows: PowerShell Get-Counter でプロセッサ使用率を取得。
 """
 
 from __future__ import annotations
 
+import ctypes
+import ctypes.util
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -56,6 +57,85 @@ class CpuUsage:
 _IS_DARWIN = sys.platform == "darwin"
 _IS_WIN = sys.platform == "win32"
 
+# ─── macOS Mach API (ctypes) ───────────────────────────────────
+# host_processor_info() で per-core CPU ticks を直接取得。
+# subprocess を使わないため ~0.1ms で完了する (top -l 1 は ~800ms)。
+
+# Mach 定数
+_CPU_STATE_USER = 0
+_CPU_STATE_SYSTEM = 1
+_CPU_STATE_IDLE = 2
+_CPU_STATE_NICE = 3
+_CPU_STATE_MAX = 4  # ticks per core
+_PROCESSOR_CPU_LOAD_INFO = 2
+_HOST_PRIV_NULL = 0
+
+_libc = None
+
+
+def _darwin_host_processor_info() -> dict[str, CpuTimes]:
+    """Mach host_processor_info で per-core CPU ticks を取得 (macOS 専用)。"""
+    global _libc
+    if _libc is None:
+        _libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+
+    libc = _libc
+
+    # mach_host_self()
+    host = libc.mach_host_self()
+
+    processor_count = ctypes.c_uint(0)
+    info_array = ctypes.POINTER(ctypes.c_int)()
+    info_count = ctypes.c_uint(0)
+
+    # host_processor_info(host, PROCESSOR_CPU_LOAD_INFO, &count, &info, &info_cnt)
+    kr = libc.host_processor_info(
+        host,
+        ctypes.c_int(_PROCESSOR_CPU_LOAD_INFO),
+        ctypes.byref(processor_count),
+        ctypes.byref(info_array),
+        ctypes.byref(info_count),
+    )
+    if kr != 0:
+        return {}
+
+    n_cpus = processor_count.value
+    result: dict[str, CpuTimes] = {}
+    total_user = total_nice = total_system = total_idle = 0
+
+    for i in range(n_cpus):
+        base = i * _CPU_STATE_MAX
+        user = info_array[base + _CPU_STATE_USER]
+        system = info_array[base + _CPU_STATE_SYSTEM]
+        idle = info_array[base + _CPU_STATE_IDLE]
+        nice = info_array[base + _CPU_STATE_NICE]
+
+        result[f"cpu{i}"] = CpuTimes(
+            user=user, nice=nice, system=system, idle=idle,
+        )
+        total_user += user
+        total_nice += nice
+        total_system += system
+        total_idle += idle
+
+    # 合計
+    result["cpu"] = CpuTimes(
+        user=total_user, nice=total_nice,
+        system=total_system, idle=total_idle,
+    )
+
+    # メモリ解放: vm_deallocate(mach_task_self(), info_array, info_count * sizeof(int))
+    try:
+        libc.vm_deallocate(
+            libc.mach_task_self(),
+            info_array,
+            ctypes.c_uint(info_count.value * ctypes.sizeof(ctypes.c_int)),
+        )
+    except Exception:
+        pass
+
+    return result
+
 
 class CpuCollector:
     """CPU 使用率コレクター。"""
@@ -83,28 +163,14 @@ class CpuCollector:
         return result
 
     def _read_stat_darwin(self) -> dict[str, CpuTimes]:
-        """macOS: sysctl で CPU ticks を取得。"""
+        """macOS: Mach host_processor_info で per-core CPU ticks を取得。"""
         result: dict[str, CpuTimes] = {}
         try:
-            # kern.cp_time: user nice sys idle (マイクロ秒)
-            out = subprocess.run(
-                ["sysctl", "-n", "kern.cp_time"],
-                capture_output=True, text=True, timeout=2,
-            )
-            if out.returncode == 0:
-                parts = out.stdout.strip().split()
-                if len(parts) >= 4:
-                    result["cpu"] = CpuTimes(
-                        user=int(parts[0]),
-                        nice=int(parts[1]),
-                        system=int(parts[2]),
-                        idle=int(parts[3]),
-                    )
-        except (OSError, subprocess.TimeoutExpired):
+            result = _darwin_host_processor_info()
+        except Exception:
             pass
-
         if not result:
-            # フォールバック: top -l 1 で概算
+            # フォールバック: top -l 1 で概算 (遅い)
             try:
                 out = subprocess.run(
                     ["top", "-l", "1", "-n", "0", "-s", "0"],
@@ -112,8 +178,6 @@ class CpuCollector:
                 )
                 for line in out.stdout.splitlines():
                     if "CPU usage:" in line:
-                        # "CPU usage: 5.26% user, 10.52% sys, 84.21% idle"
-                        # ticks に変換 (概算)
                         user = sys_pct = idle = 0.0
                         for part in line.split(","):
                             part = part.strip()
@@ -132,7 +196,6 @@ class CpuCollector:
                         break
             except (OSError, subprocess.TimeoutExpired, ValueError):
                 pass
-
         return result
 
     def _read_stat_win(self) -> dict[str, CpuTimes]:
