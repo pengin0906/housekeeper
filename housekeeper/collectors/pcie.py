@@ -167,7 +167,10 @@ class PcieCollector:
         self._prev_net: dict[str, tuple[int, int]] = {}   # name → (rx_bytes, tx_bytes)
         self._prev_time: float = 0.0
         self._nvidia_pcie: bool = bool(shutil.which("nvidia-smi"))
+        self._gpu_bdf_map: dict[str, int] = {}  # sysfs BDF → GPU index
         self._discover_subsystems()
+        if self._nvidia_pcie:
+            self._discover_nvidia_gpus()
 
     def _discover_subsystems(self) -> None:
         """PCIe BDF アドレスとサブシステムデバイス (NVMe, NIC) の対応付け。"""
@@ -195,6 +198,87 @@ class PcieCollector:
                 for iface in net_dir.iterdir():
                     self._device_subsystems[address] = ("network", iface.name)
                     break
+
+    def _discover_nvidia_gpus(self) -> None:
+        """nvidia-smi から GPU index → sysfs BDF アドレスのマッピングを構築。"""
+        try:
+            result = subprocess.run(
+                ["nvidia-smi", "--query-gpu=index,gpu_bus_id",
+                 "--format=csv,noheader"],
+                capture_output=True, text=True, timeout=5,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return
+
+        if result.returncode != 0:
+            return
+
+        for line in result.stdout.strip().splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 2:
+                continue
+            try:
+                idx = int(parts[0])
+                # nvidia-smi: "00000000:D1:00.0" → sysfs: "0000:d1:00.0"
+                raw_bdf = parts[1].strip()
+                bdf = self._normalize_bdf(raw_bdf)
+                self._gpu_bdf_map[bdf] = idx
+                self._device_subsystems[bdf] = ("gpu", f"GPU{idx}")
+            except (ValueError, IndexError):
+                pass
+
+    @staticmethod
+    def _normalize_bdf(bdf: str) -> str:
+        """nvidia-smi の BDF を sysfs 形式に正規化。
+
+        "00000000:D1:00.0" → "0000:d1:00.0"
+        "0000:d1:00.0"     → "0000:d1:00.0"
+        """
+        bdf = bdf.lower().strip()
+        # 8桁ドメインを4桁に変換
+        parts = bdf.split(":")
+        if len(parts) >= 3 and len(parts[0]) == 8:
+            parts[0] = parts[0][4:]  # 00000000 → 0000
+            bdf = ":".join(parts)
+        return bdf
+
+    def _read_nvidia_pcie_throughput(self) -> dict[int, tuple[float, float]]:
+        """nvidia-smi dmon から GPU ごとの PCIe RX/TX スループットを取得。
+
+        Returns: {gpu_index: (rx_bytes_sec, tx_bytes_sec)}
+        """
+        if not self._nvidia_pcie:
+            return {}
+
+        try:
+            result = subprocess.run(
+                ["nvidia-smi", "dmon", "-s", "t", "-c", "1"],
+                capture_output=True, text=True, timeout=5,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return {}
+
+        if result.returncode != 0:
+            return {}
+
+        throughput: dict[int, tuple[float, float]] = {}
+        for line in result.stdout.strip().splitlines():
+            line = line.strip()
+            if line.startswith("#") or not line:
+                continue
+            fields = line.split()
+            if len(fields) < 3:
+                continue
+            try:
+                idx = int(fields[0])
+                # dmon -s t: rxpci (MB/s), txpci (MB/s)
+                rx_mbs = float(fields[1])
+                tx_mbs = float(fields[2])
+                throughput[idx] = (rx_mbs * 1_048_576, tx_mbs * 1_048_576)
+            except (ValueError, IndexError):
+                pass
+
+        return throughput
 
     def _read_disk_stats(self) -> dict[str, tuple[int, int]]:
         """diskstats から NVMe の読み書きセクターを取得。"""
@@ -241,6 +325,7 @@ class PcieCollector:
         # I/O カウンタ読み取り
         curr_disk = self._read_disk_stats()
         curr_net = self._read_net_stats()
+        gpu_pcie = self._read_nvidia_pcie_throughput()
 
         devices: list[PcieDeviceInfo] = []
 
@@ -295,23 +380,28 @@ class PcieCollector:
             io_label = ""
 
             subsystem = self._device_subsystems.get(address)
-            if subsystem and dt > 0:
+            if subsystem:
                 sub_type, sub_label = subsystem
                 io_label = sub_label
 
-                if sub_type == "storage" and sub_label in curr_disk:
+                if sub_type == "storage" and sub_label in curr_disk and dt > 0:
                     rd_sectors, wr_sectors = curr_disk[sub_label]
                     prev = self._prev_disk.get(sub_label)
                     if prev is not None:
                         io_read = 512.0 * (rd_sectors - prev[0]) / dt
                         io_write = 512.0 * (wr_sectors - prev[1]) / dt
 
-                elif sub_type == "network" and sub_label in curr_net:
+                elif sub_type == "network" and sub_label in curr_net and dt > 0:
                     rx_bytes, tx_bytes = curr_net[sub_label]
                     prev = self._prev_net.get(sub_label)
                     if prev is not None:
                         io_read = (rx_bytes - prev[0]) / dt   # RX
                         io_write = (tx_bytes - prev[1]) / dt  # TX
+
+                elif sub_type == "gpu":
+                    gpu_idx = self._gpu_bdf_map.get(address)
+                    if gpu_idx is not None and gpu_idx in gpu_pcie:
+                        io_read, io_write = gpu_pcie[gpu_idx]
 
             devices.append(PcieDeviceInfo(
                 address=address,
