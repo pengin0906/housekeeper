@@ -1,8 +1,8 @@
 # housekeeper
 
-**xosview 風のシステムモニター + GPU/PCIe/NFS/温度 完全対応**
+システムモニター + GPU/PCIe/NFS/温度 完全対応**
 
-xosview のようなバーメーター形式で、CPU・メモリ・ディスク・ネットワーク・GPU・PCIe・NFS/SAN/NAS・温度を一画面で監視できるツール。
+バーメーター形式で、CPU・メモリ・ディスク・ネットワーク・GPU・PCIe・NFS/SAN/NAS・温度を一画面で監視できるツール。
 
 ## 特徴
 
