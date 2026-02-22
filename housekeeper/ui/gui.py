@@ -568,9 +568,10 @@ class HousekeeperGui:
             if geo:
                 self.root.geometry(geo)
         else:
-            # 通常 → サマリー: 現在のジオメトリを保存
+            # 通常 → サマリー: 現在のジオメトリを保存しスクロールをリセット
             self._pre_summary_geometry = self.root.geometry()
             self._summary_mode = True
+            self.canvas.yview_moveto(0)
 
     def _toggle_temp_unit(self) -> None:
         self._temp_unit = "F" if self._temp_unit == "C" else "C"
@@ -1165,6 +1166,9 @@ class HousekeeperGui:
         self._c_width = self.canvas.winfo_width() or 850
         c_width = self._c_width
         c_height_vis = self.canvas.winfo_height() or 900
+        # サマリーモードはスクロール不要 → 常にトップ
+        if self._summary_mode:
+            self.canvas.yview_moveto(0)
         # ビューポート + 上下マージン (スクロール時の空白防止)
         vt = self.canvas.canvasy(0)
         self._view_top = vt - c_height_vis
