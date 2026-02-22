@@ -195,6 +195,11 @@ class HousekeeperGui:
         self._help_btn_zone: tuple[int, int, int, int] = (0, 0, 0, 0)  # x1,y1,x2,y2
         self._show_help: bool = False
 
+        # 自動スケール用ピーク値 (減衰付き)
+        self._peak_net_bps: float = 1_000.0    # 最低 1KB/s
+        self._peak_disk_bps: float = 1_000.0
+        self._peak_nfs_bps: float = 1_000.0
+
         # ウィンドウ設定
         self.root = tk.Tk()
         self.root.title("housekeeper - System Monitor")
@@ -629,56 +634,65 @@ class HousekeeperGui:
         if disk_data:
             total_r = sum(d.read_bytes_sec for d in disk_data)
             total_w = sum(d.write_bytes_sec for d in disk_data)
+            # 自動スケール: 現在のピーク値を追跡 (ゆっくり減衰)
+            cur_disk_peak = max(max((d.read_bytes_sec for d in disk_data), default=0),
+                                max((d.write_bytes_sec for d in disk_data), default=0))
+            if cur_disk_peak > self._peak_disk_bps:
+                self._peak_disk_bps = cur_disk_peak
+            else:
+                self._peak_disk_bps = max(self._peak_disk_bps * 0.95, cur_disk_peak, 1_000.0)
+            disk_scale = self._peak_disk_bps * 1.2  # 20% headroom
             summary = f"R:{_fmt_bytes_sec(total_r)} W:{_fmt_bytes_sec(total_w)}"
             y = self._draw_section_header(y, "disk", f"Disk I/O ({len(disk_data)} devs)", summary)
             if self.expanded["disk"]:
                 show_raid = self.expanded.get("raid_members", False)
                 for d in disk_data:
-                    max_bw = 1_073_741_824.0
-                    segs = [(min(d.read_bytes_sec / max_bw, 0.5), COLORS["cache"]),
-                            (min(d.write_bytes_sec / max_bw, 0.5), COLORS["iowait"])]
+                    segs = [(min(d.read_bytes_sec / disk_scale, 0.5), COLORS["cache"]),
+                            (min(d.write_bytes_sec / disk_scale, 0.5), COLORS["iowait"])]
                     val = f"R:{_fmt_bytes_sec(d.read_bytes_sec)} W:{_fmt_bytes_sec(d.write_bytes_sec)}"
 
                     if d.raid_level:
-                        # RAID デバイス: クリックでメンバー展開
                         y = self._draw_toggle_row(
                             y, "raid_members",
                             d.display_name.upper(), segs, val)
                     elif d.raid_member_of:
-                        # RAID メンバー: 展開時のみ表示
                         if show_raid:
                             y = self._draw_bar(y, f" └{d.name}", segs, val)
                     else:
                         y = self._draw_bar(y, d.display_name.upper(), segs, val)
             else:
-                max_bw = 1_073_741_824.0 * len(disk_data)
                 y = self._draw_bar(y, "ALL",
-                                   [(min(total_r / max_bw, 0.5), COLORS["cache"]),
-                                    (min(total_w / max_bw, 0.5), COLORS["iowait"])],
+                                   [(min(total_r / disk_scale / len(disk_data), 0.5), COLORS["cache"]),
+                                    (min(total_w / disk_scale / len(disk_data), 0.5), COLORS["iowait"])],
                                    f"R:{_fmt_bytes_sec(total_r)} W:{_fmt_bytes_sec(total_w)}")
 
         # ─── Network ──────────────────────────────────────
         if net_data:
             total_rx = sum(n.rx_bytes_sec for n in net_data)
             total_tx = sum(n.tx_bytes_sec for n in net_data)
-            summary = f"D:{_fmt_bytes_sec(total_rx)} U:{_fmt_bytes_sec(total_tx)}"
+            # 自動スケール
+            cur_net_peak = max(max((n.rx_bytes_sec for n in net_data), default=0),
+                               max((n.tx_bytes_sec for n in net_data), default=0))
+            if cur_net_peak > self._peak_net_bps:
+                self._peak_net_bps = cur_net_peak
+            else:
+                self._peak_net_bps = max(self._peak_net_bps * 0.95, cur_net_peak, 1_000.0)
+            net_scale = self._peak_net_bps * 1.2
+            summary = f"D:{_fmt_bytes_sec(total_rx)} U:{_fmt_bytes_sec(total_tx)} [{_fmt_bytes_sec(net_scale)}]"
             y = self._draw_section_header(y, "network", "Network", summary)
             if self.expanded["network"]:
                 show_bond = self.expanded.get("bond_members", False)
                 for n in net_data:
-                    max_bw = 125_000_000.0
                     tag = n.net_type.value if hasattr(n, "net_type") else "???"
-                    segs = [(min(n.rx_bytes_sec / max_bw, 0.5), COLORS["net_rx"]),
-                            (min(n.tx_bytes_sec / max_bw, 0.5), COLORS["net_tx"])]
+                    segs = [(min(n.rx_bytes_sec / net_scale, 0.5), COLORS["net_rx"]),
+                            (min(n.tx_bytes_sec / net_scale, 0.5), COLORS["net_tx"])]
                     val = f"D:{_fmt_bytes_sec(n.rx_bytes_sec)} U:{_fmt_bytes_sec(n.tx_bytes_sec)}"
 
                     if n.bond_mode:
-                        # Bond デバイス: クリックでメンバー展開
                         y = self._draw_toggle_row(
                             y, "bond_members",
                             n.display_name, segs, val)
                     elif n.bond_member_of:
-                        # Bond メンバー: 展開時のみ表示
                         if show_bond:
                             y = self._draw_bar(y, f" └{n.name}", segs, val)
                     else:
@@ -686,14 +700,21 @@ class HousekeeperGui:
 
         # ─── NFS ──────────────────────────────────────────
         if nfs_data:
+            # 自動スケール
+            cur_nfs_peak = max(max((m.read_bytes_sec for m in nfs_data), default=0),
+                               max((m.write_bytes_sec for m in nfs_data), default=0))
+            if cur_nfs_peak > self._peak_nfs_bps:
+                self._peak_nfs_bps = cur_nfs_peak
+            else:
+                self._peak_nfs_bps = max(self._peak_nfs_bps * 0.95, cur_nfs_peak, 1_000.0)
+            nfs_scale = self._peak_nfs_bps * 1.2
             summary = f"{len(nfs_data)} mounts"
             y = self._draw_section_header(y, "nfs", "NFS/SAN/NAS", summary)
             if self.expanded["nfs"]:
                 for mt in nfs_data:
-                    max_bw = 125_000_000.0
                     y = self._draw_bar(y, f"{mt.type_label} {mt.mount_point}"[:12],
-                                       [(min(mt.read_bytes_sec / max_bw, 0.5), COLORS["net_rx"]),
-                                        (min(mt.write_bytes_sec / max_bw, 0.5), COLORS["net_tx"])],
+                                       [(min(mt.read_bytes_sec / nfs_scale, 0.5), COLORS["net_rx"]),
+                                        (min(mt.write_bytes_sec / nfs_scale, 0.5), COLORS["net_tx"])],
                                        f"R:{_fmt_bytes_sec(mt.read_bytes_sec)} W:{_fmt_bytes_sec(mt.write_bytes_sec)}")
 
         # ─── PCIe ─────────────────────────────────────────
