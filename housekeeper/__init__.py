@@ -1,3 +1,3 @@
-"""housekeeper - xosview-like system monitor with NVIDIA GPU support."""
+"""housekeeper - xosview-like system monitor with GPU/PCIe/NFS/Temperature support."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

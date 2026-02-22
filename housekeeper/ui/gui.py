@@ -591,19 +591,25 @@ class HousekeeperGui:
                 for g in nvidia_data:
                     frac = min(g.temperature_c / 100.0, 1.0)
                     color = COLORS["gpu_temp"] if g.temperature_c > 80 else COLORS["user"]
-                    y = self._draw_bar(y, f"GPU{g.index}",
-                                       [(frac, color)], f"{g.temperature_c:.0f}C")
+                    val = f"{g.temperature_c:.0f}C"
+                    y = self._draw_bar(y, f"🎮GPU{g.index}",
+                                       [(frac, color)], val)
+                    if g.fan_speed_pct >= 0:
+                        fan_frac = min(g.fan_speed_pct / 100.0, 1.0)
+                        y = self._draw_bar(y, f"  FAN{g.index}",
+                                           [(fan_frac, COLORS["gpu_fan"])],
+                                           f"{g.fan_speed_pct:.0f}%")
                 for g in amd_data:
                     if g.temperature_c > 0:
                         frac = min(g.temperature_c / 100.0, 1.0)
                         color = COLORS["gpu_temp"] if g.temperature_c > 80 else COLORS["user"]
-                        y = self._draw_bar(y, f"AMD{g.index}",
+                        y = self._draw_bar(y, f"🎮AMD{g.index}",
                                            [(frac, color)], f"{g.temperature_c:.0f}C")
                 for d in gaudi_data:
                     if d.temperature_c > 0:
                         frac = min(d.temperature_c / 100.0, 1.0)
                         color = COLORS["gpu_temp"] if d.temperature_c > 80 else COLORS["user"]
-                        y = self._draw_bar(y, f"HL{d.index}",
+                        y = self._draw_bar(y, f"🧮HL{d.index}",
                                            [(frac, color)], f"{d.temperature_c:.0f}C")
 
         # ─── Disk I/O ─────────────────────────────────────

@@ -1,28 +1,43 @@
 [build-system]
-requires = ["setuptools>=68.0", "setuptools-scm>=8.0"]
+requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "housekeeper"
-version = "0.1.0"
+name = "housekeeper-monitor"
+version = "0.2.0"
 description = "xosview-like system monitor with GPU/PCIe/NFS/Temperature support"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 authors = [{ name = "pengin0906" }]
-keywords = ["system-monitor", "nvidia", "gpu", "xosview", "tui", "temperature", "pcie"]
+keywords = ["system-monitor", "nvidia", "amd", "gpu", "xosview", "tui", "gui", "temperature", "pcie", "gaudi"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console :: Curses",
+    "Environment :: X11 Applications",
     "Intended Audience :: System Administrators",
-    "License :: OSI Approved :: MIT License",
+    "Intended Audience :: Developers",
     "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: System :: Monitoring",
 ]
+
+[project.urls]
+Homepage = "https://github.com/pengin0906/housekeeper"
+Repository = "https://github.com/pengin0906/housekeeper"
+Issues = "https://github.com/pengin0906/housekeeper/issues"
 
 [project.scripts]
 housekeeper = "housekeeper.main:main"
 
 [project.optional-dependencies]
 nvml = ["pynvml>=11.5.0"]
+
+[tool.setuptools.packages.find]
+include = ["housekeeper*"]
