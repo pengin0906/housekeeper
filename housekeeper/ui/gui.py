@@ -214,8 +214,10 @@ class HousekeeperGui:
         self._temp_unit: str = "C"  # "C" or "F"
 
         # 折れ線グラフ: 履歴バッファ + モード
-        self._history_len = 60  # 60サンプル (≈1分 @ 1s)
+        self._history_time_sec = 60  # グラフの時間幅 (秒)
+        self._history_len = max(self._history_time_sec * 1000 // self.interval_ms, 10)
         self._history: dict[str, deque] = {}
+        self._frame_count: int = 0  # フレームカウンター (時間軸揃え用)
         self._line_mode: set[str] = set()  # 折れ線モードの個別バーキー
         self._line_default: bool = True   # 新規バーをデフォルトで折れ線にする
         self._known_bars: set[str] = set()  # 既知のバーキー (初回登録用)
@@ -610,11 +612,22 @@ class HousekeeperGui:
 
     def _change_interval(self, delta_ms: int) -> None:
         self.interval_ms = max(100, min(10000, self.interval_ms + delta_ms))
+        new_len = max(self._history_time_sec * 1000 // self.interval_ms, 10)
+        if new_len != self._history_len:
+            self._history_len = new_len
+            # 全 deque の maxlen を更新
+            for key in list(self._history):
+                old = self._history[key]
+                d = deque(old, maxlen=new_len)
+                self._history[key] = d
 
     def _record(self, key: str, value: float) -> None:
         """履歴データを記録。"""
         if key not in self._history:
-            self._history[key] = deque(maxlen=self._history_len)
+            d = deque(maxlen=self._history_len)
+            for _ in range(self._frame_count):
+                d.append(0.0)
+            self._history[key] = d
         self._history[key].append(value)
 
     # チャート切り替え可能なセクション
@@ -1155,6 +1168,7 @@ class HousekeeperGui:
               kern_data, proc_data, nvidia_data, amd_data, gaudi_data,
               apple_data, gpu_proc_data, nfs_data, pcie_data, temp_data) -> None:
         """キャッシュ済みデータで描画。"""
+        self._frame_count += 1
         t_draw_start = time.perf_counter()
         self.canvas.delete("all")
         self._header_zones.clear()
@@ -1166,9 +1180,6 @@ class HousekeeperGui:
         self._c_width = self.canvas.winfo_width() or 850
         c_width = self._c_width
         c_height_vis = self.canvas.winfo_height() or 900
-        # サマリーモードはスクロール不要 → 常にトップ
-        if self._summary_mode:
-            self.canvas.yview_moveto(0)
         # ビューポート + 上下マージン (スクロール時の空白防止)
         vt = self.canvas.canvasy(0)
         self._view_top = vt - c_height_vis
@@ -1464,25 +1475,27 @@ class HousekeeperGui:
             all_temps += [d.temperature_c for d in gaudi_data if d.temperature_c > 0]
             max_temp = max(all_temps, default=0)
             n_sensors = len(all_temps)
-            # 履歴記録 — カテゴリ別最高温度を記録 (サマリーグラフ用)
+            # 履歴記録 — キャッシュ更新時のみ (時間軸を他セクションと揃える)
             _cat_maxes: dict[str, float] = {}
             for dev in temp_data:
                 cat = dev.category
                 t = dev.primary_temp_c
                 _cat_maxes[cat] = max(_cat_maxes.get(cat, 0.0), t)
-                # DDR: 各DIMM個別に記録
+                if cat == "DDR" and len(dev.sensors) > 1:
+                    for sens in dev.sensors:
+                        _cat_maxes[cat] = max(_cat_maxes.get(cat, 0.0), sens.temp_c)
+            for dev in temp_data:
+                cat = dev.category
                 if cat == "DDR" and len(dev.sensors) > 1:
                     for sens in dev.sensors:
                         slabel = sens.label.replace("TEMP_", "")
                         self._record(f"temp_DDR_{slabel}", sens.temp_c)
-                        _cat_maxes[cat] = max(_cat_maxes.get(cat, 0.0), sens.temp_c)
             for cat, t in _cat_maxes.items():
                 self._record(f"temp_{cat}", t)
             for g in nvidia_data:
                 self._record(f"temp_GPU{g.index}", g.temperature_c)
-            summary = f"Max:{self._fmt_temp(max_temp)}  {n_sensors} sensors"
-            # temp_max を記録 (サマリー用)
             self._record("temp_max", max_temp)
+            summary = f"Max:{self._fmt_temp(max_temp)}  {n_sensors} sensors"
             if sm and "temp" not in se:
                 # CPU, GPU, MB, MEM の各カテゴリ最高温度を降順で
                 _items: list[tuple[float, str, str, str]] = []  # (temp, label, hkey, color)
@@ -1815,16 +1828,16 @@ class HousekeeperGui:
                 else:
                     self._peak_pcie_bps = max(self._peak_pcie_bps * 0.95, cur_pcie_peak, 1_000.0)
             pcie_scale = self._peak_pcie_bps * 1.2
-            # 個別デバイス履歴記録
+            # 個別デバイス履歴記録 (address はユニーク)
             for d in pcie_data:
                 if d.io_label:
-                    pk = f"pcie_{d.short_name}"
+                    pk = f"pcie_{d.address}"
                     self._record(f"{pk}_R", d.io_read_bytes_sec)
                     self._record(f"{pk}_W", d.io_write_bytes_sec)
             summary = f"{len(pcie_data)} devices [{_fmt_bytes_sec(pcie_scale)}]"
             if sm and "pcie" not in se:
                 if io_devs:
-                    pk0 = f"pcie_{io_devs[0].short_name}"
+                    pk0 = f"pcie_{io_devs[0].address}"
                     y = self._draw_summary_row(y, "PCIe",
                                                [(f"{pk0}_R", COLORS["cache"]),
                                                 (f"{pk0}_W", COLORS["iowait"])],
@@ -1839,7 +1852,7 @@ class HousekeeperGui:
                     link = f"{d.gen_name} x{d.current_width}"
                     if d.io_label:
                         bar_label = f"{icon}{d.io_label}" if icon else d.io_label
-                        pk = f"pcie_{d.short_name}"
+                        pk = f"pcie_{d.address}"
                         y = self._draw_bar(y, bar_label,
                                            [(min(d.io_read_bytes_sec / pcie_scale, 0.5), COLORS["cache"]),
                                             (min(d.io_write_bytes_sec / pcie_scale, 0.5), COLORS["iowait"])],
