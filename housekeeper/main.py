@@ -105,7 +105,7 @@ def _run_tui(stdscr: curses.window, args: argparse.Namespace) -> None:
     mem_col = MemoryCollector()
     disk_col = DiskCollector()
     net_col = NetworkCollector()
-    proc_col = ProcessCollector(top_n=8)
+    proc_col = ProcessCollector(top_n=0)
     kern_col = KernelCollector()
 
     # === 条件付きコレクター (遅延ロード) ===
@@ -221,6 +221,10 @@ def _run_tui(stdscr: curses.window, args: argparse.Namespace) -> None:
             renderer.show_gpus = not renderer.show_gpus
         elif key == ord("i") or key == ord("I"):
             renderer.show_disks = not renderer.show_disks
+        elif key == ord("s") or key == ord("S"):
+            renderer.show_nfs = not renderer.show_nfs
+        elif key == ord("f") or key == ord("F"):
+            renderer.temp_unit = "F" if renderer.temp_unit == "C" else "C"
         elif key == ord("h") or key == ord("H"):
             renderer.show_help = not renderer.show_help
         elif key == ord("+") or key == ord("="):
@@ -244,7 +248,7 @@ def _collect_all(args: argparse.Namespace) -> dict:
     mem_col = MemoryCollector()
     disk_col = DiskCollector()
     net_col = NetworkCollector()
-    proc_col = ProcessCollector(top_n=8)
+    proc_col = ProcessCollector(top_n=0)
     kern_col = KernelCollector()
 
     accel = _detect_accelerators()

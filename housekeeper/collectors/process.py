@@ -135,8 +135,8 @@ class ProcessCollector:
 
     def _read_proc(self, pid: int) -> _ProcStat | None:
         try:
-            stat_path = Path(f"/proc/{pid}/stat")
-            stat_data = stat_path.read_text()
+            with open(f"/proc/{pid}/stat") as f:
+                stat_data = f.read()
 
             # comm はカッコで囲まれている: "pid (comm) state ..."
             lparen = stat_data.index("(")
@@ -151,14 +151,15 @@ class ProcessCollector:
 
             return _ProcStat(pid=pid, comm=comm, state=state,
                              utime=utime, stime=stime, rss=rss)
-        except (FileNotFoundError, PermissionError, ValueError, IndexError):
+        except (FileNotFoundError, PermissionError, ValueError, IndexError, OSError):
             return None
 
     def _read_cmdline(self, pid: int) -> str:
         try:
-            data = Path(f"/proc/{pid}/cmdline").read_text()
+            with open(f"/proc/{pid}/cmdline") as f:
+                data = f.read()
             return data.replace("\0", " ").strip()
-        except (FileNotFoundError, PermissionError):
+        except (FileNotFoundError, PermissionError, OSError):
             return ""
 
     def collect(self) -> list[ProcessInfo]:
@@ -210,9 +211,9 @@ class ProcessCollector:
         self._prev = curr
         self._prev_time = now
 
-        # CPU 使用率でソートして上位 N 件
+        # CPU 使用率でソートして上位 N 件 (top_n=0 は全件)
         processes.sort(key=lambda p: p.cpu_pct, reverse=True)
-        return processes[:self.top_n]
+        return processes if self.top_n <= 0 else processes[:self.top_n]
 
     def _collect_darwin(self) -> list[ProcessInfo]:
         """macOS: ps でプロセス情報を取得。"""
@@ -247,7 +248,7 @@ class ProcessCollector:
             pass
 
         processes.sort(key=lambda p: p.cpu_pct, reverse=True)
-        return processes[:self.top_n]
+        return processes if self.top_n <= 0 else processes[:self.top_n]
 
     def _collect_win(self) -> list[ProcessInfo]:
         """Windows: PowerShell でプロセス情報を取得。"""
@@ -288,4 +289,4 @@ class ProcessCollector:
             pass
 
         processes.sort(key=lambda p: p.cpu_pct, reverse=True)
-        return processes[:self.top_n]
+        return processes if self.top_n <= 0 else processes[:self.top_n]

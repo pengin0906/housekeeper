@@ -188,6 +188,14 @@ class PcieCollector:
         self._prev_time: float = 0.0
         self._nvidia_pcie: bool = bool(shutil.which("nvidia-smi"))
         self._gpu_bdf_map: dict[str, int] = {}  # sysfs BDF → GPU index
+        # pynvml PCIe (nvidia-smi dmon の高速代替)
+        self._pynvml = None
+        self._nvml_handles: list | None = None  # None=未初期化
+        # nvidia-smi dmon フォールバック用キャッシュ
+        self._dmon_cache: dict[int, tuple[float, float]] = {}
+        self._dmon_cache_time: float = 0.0
+        # PCIe デバイスリストのキャッシュ (静的情報)
+        self._cached_devices: list[tuple] | None = None
         if _IS_LINUX:
             self._discover_subsystems()
             if self._nvidia_pcie:
@@ -263,13 +271,64 @@ class PcieCollector:
             bdf = ":".join(parts)
         return bdf
 
-    def _read_nvidia_pcie_throughput(self) -> dict[int, tuple[float, float]]:
-        """nvidia-smi dmon から GPU ごとの PCIe RX/TX スループットを取得。
+    def _init_nvml_pcie(self) -> None:
+        """pynvml で GPU PCIe スループット取得を初期化。"""
+        if self._nvml_handles is not None:
+            return  # 初期化済み
+        self._nvml_handles = []
+        try:
+            import pynvml  # type: ignore[import-untyped]
+            pynvml.nvmlInit()
+            count = pynvml.nvmlDeviceGetCount()
+            for i in range(count):
+                self._nvml_handles.append(pynvml.nvmlDeviceGetHandleByIndex(i))
+            self._pynvml = pynvml
+        except Exception:
+            self._pynvml = None
+            self._nvml_handles = []
 
+    def _read_nvidia_pcie_throughput(self) -> dict[int, tuple[float, float]]:
+        """GPU ごとの PCIe RX/TX スループットを取得。
+
+        pynvml API を使用。API 呼び出しが ~21ms/回と重いため2秒間キャッシュ。
         Returns: {gpu_index: (rx_bytes_sec, tx_bytes_sec)}
         """
         if not self._nvidia_pcie:
             return {}
+
+        # キャッシュチェック (5秒間有効 - API呼び出しが ~21ms/GPU と重い)
+        now = time.monotonic()
+        if now - self._dmon_cache_time < 5.0 and self._dmon_cache:
+            return self._dmon_cache
+
+        self._init_nvml_pcie()
+        if not self._pynvml or not self._nvml_handles:
+            return self._read_nvidia_pcie_throughput_fallback()
+
+        pynvml = self._pynvml
+        throughput: dict[int, tuple[float, float]] = {}
+        try:
+            for i, handle in enumerate(self._nvml_handles):
+                try:
+                    rx_kbs = pynvml.nvmlDeviceGetPcieThroughput(
+                        handle, pynvml.NVML_PCIE_UTIL_RX_BYTES)
+                    tx_kbs = pynvml.nvmlDeviceGetPcieThroughput(
+                        handle, pynvml.NVML_PCIE_UTIL_TX_BYTES)
+                    throughput[i] = (rx_kbs * 1024.0, tx_kbs * 1024.0)
+                except pynvml.NVMLError:
+                    pass
+        except Exception:
+            return self._read_nvidia_pcie_throughput_fallback()
+
+        self._dmon_cache = throughput
+        self._dmon_cache_time = now
+        return throughput
+
+    def _read_nvidia_pcie_throughput_fallback(self) -> dict[int, tuple[float, float]]:
+        """nvidia-smi dmon フォールバック (pynvml 利用不可時)。結果をキャッシュ。"""
+        now = time.monotonic()
+        if now - self._dmon_cache_time < 3.0 and self._dmon_cache:
+            return self._dmon_cache
 
         try:
             result = subprocess.run(
@@ -277,10 +336,10 @@ class PcieCollector:
                 capture_output=True, text=True, timeout=5,
             )
         except (subprocess.TimeoutExpired, FileNotFoundError):
-            return {}
+            return self._dmon_cache
 
         if result.returncode != 0:
-            return {}
+            return self._dmon_cache
 
         throughput: dict[int, tuple[float, float]] = {}
         for line in result.stdout.strip().splitlines():
@@ -292,13 +351,14 @@ class PcieCollector:
                 continue
             try:
                 idx = int(fields[0])
-                # dmon -s t: rxpci (MB/s), txpci (MB/s)
                 rx_mbs = float(fields[1])
                 tx_mbs = float(fields[2])
                 throughput[idx] = (rx_mbs * 1_048_576, tx_mbs * 1_048_576)
             except (ValueError, IndexError):
                 pass
 
+        self._dmon_cache = throughput
+        self._dmon_cache_time = now
         return throughput
 
     def _read_disk_stats(self) -> dict[str, tuple[int, int]]:
@@ -335,38 +395,36 @@ class PcieCollector:
             pass
         return result
 
-    def collect(self) -> list[PcieDeviceInfo]:
-        if not _IS_LINUX:
-            # macOS: system_profiler は遅いので基本的には空を返す
+    def _discover_devices(self) -> list[tuple]:
+        """PCIe デバイスの静的情報をスキャンしてキャッシュ。
+
+        Returns: [(address, name, speed, max_speed, width, max_width, device_type, sub_type, sub_label), ...]
+        """
+        import os
+        pci_root = "/sys/bus/pci/devices"
+        if not os.path.isdir(pci_root):
             return []
 
-        pci_path = Path("/sys/bus/pci/devices")
-        if not pci_path.exists():
-            return []
-
-        now = time.monotonic()
-        dt = now - self._prev_time if self._prev_time else 0.0
-
-        # I/O カウンタ読み取り
-        curr_disk = self._read_disk_stats()
-        curr_net = self._read_net_stats()
-        gpu_pcie = self._read_nvidia_pcie_throughput()
-
-        devices: list[PcieDeviceInfo] = []
-
-        for dev_dir in sorted(pci_path.iterdir()):
-            address = dev_dir.name
-
-            # PCIe リンクステータスファイルがあるデバイスのみ
-            speed_file = dev_dir / "current_link_speed"
-            width_file = dev_dir / "current_link_width"
-            if not speed_file.exists():
+        result = []
+        for address in sorted(os.listdir(pci_root)):
+            dev_dir = os.path.join(pci_root, address)
+            speed_file = os.path.join(dev_dir, "current_link_speed")
+            if not os.path.exists(speed_file):
                 continue
 
-            current_speed = _read_sysfs(speed_file)
-            current_width_str = _read_sysfs(width_file)
-            max_speed = _read_sysfs(dev_dir / "max_link_speed")
-            max_width_str = _read_sysfs(dev_dir / "max_link_width")
+            try:
+                with open(speed_file) as f:
+                    current_speed = f.read().strip()
+                with open(os.path.join(dev_dir, "current_link_width")) as f:
+                    current_width_str = f.read().strip()
+                with open(os.path.join(dev_dir, "max_link_speed")) as f:
+                    max_speed = f.read().strip()
+                with open(os.path.join(dev_dir, "max_link_width")) as f:
+                    max_width_str = f.read().strip()
+                with open(os.path.join(dev_dir, "class")) as f:
+                    class_code = f.read().strip()
+            except (OSError, PermissionError):
+                continue
 
             try:
                 current_width = int(current_width_str)
@@ -377,56 +435,76 @@ class PcieCollector:
             except ValueError:
                 max_width = 0
 
-            # クラスコード
-            class_code = _read_sysfs(dev_dir / "class")
-            if not class_code:
-                continue
-
             try:
                 cls = int(class_code, 16)
             except ValueError:
                 continue
 
             class_top = (cls >> 16) & 0xFF
-            # 0x03=Display, 0x01=Storage, 0x02=Network, 0x12=Processing accelerators
             if class_top not in (0x01, 0x02, 0x03, 0x12):
                 continue
 
             device_type = _classify_device(class_top)
 
-            # デバイス名の取得 (キャッシュ)
             if address not in self._device_names:
                 self._device_names[address] = _get_device_name(address)
             name = self._device_names[address]
 
-            # I/O スループット計算
+            subsystem = self._device_subsystems.get(address)
+            sub_type = subsystem[0] if subsystem else ""
+            sub_label = subsystem[1] if subsystem else ""
+
+            result.append((address, name, current_speed, max_speed,
+                          current_width, max_width, device_type,
+                          sub_type, sub_label))
+        return result
+
+    def collect(self) -> list[PcieDeviceInfo]:
+        if not _IS_LINUX:
+            return []
+
+        # デバイストポロジーをキャッシュ (変わらないので初回のみ)
+        if self._cached_devices is None:
+            self._cached_devices = self._discover_devices()
+        if not self._cached_devices:
+            return []
+
+        now = time.monotonic()
+        dt = now - self._prev_time if self._prev_time else 0.0
+
+        # 動的 I/O カウンタのみ読み取り
+        curr_disk = self._read_disk_stats()
+        curr_net = self._read_net_stats()
+        gpu_pcie = self._read_nvidia_pcie_throughput()
+
+        devices: list[PcieDeviceInfo] = []
+
+        for (address, name, current_speed, max_speed,
+             current_width, max_width, device_type,
+             sub_type, sub_label) in self._cached_devices:
+
             io_read = 0.0
             io_write = 0.0
-            io_label = ""
+            io_label = sub_label
 
-            subsystem = self._device_subsystems.get(address)
-            if subsystem:
-                sub_type, sub_label = subsystem
-                io_label = sub_label
+            if sub_type == "storage" and sub_label in curr_disk and dt > 0:
+                rd_sectors, wr_sectors = curr_disk[sub_label]
+                prev = self._prev_disk.get(sub_label)
+                if prev is not None:
+                    io_read = 512.0 * (rd_sectors - prev[0]) / dt
+                    io_write = 512.0 * (wr_sectors - prev[1]) / dt
 
-                if sub_type == "storage" and sub_label in curr_disk and dt > 0:
-                    rd_sectors, wr_sectors = curr_disk[sub_label]
-                    prev = self._prev_disk.get(sub_label)
-                    if prev is not None:
-                        io_read = 512.0 * (rd_sectors - prev[0]) / dt
-                        io_write = 512.0 * (wr_sectors - prev[1]) / dt
+            elif sub_type == "network" and sub_label in curr_net and dt > 0:
+                rx_bytes, tx_bytes = curr_net[sub_label]
+                prev = self._prev_net.get(sub_label)
+                if prev is not None:
+                    io_read = (rx_bytes - prev[0]) / dt
+                    io_write = (tx_bytes - prev[1]) / dt
 
-                elif sub_type == "network" and sub_label in curr_net and dt > 0:
-                    rx_bytes, tx_bytes = curr_net[sub_label]
-                    prev = self._prev_net.get(sub_label)
-                    if prev is not None:
-                        io_read = (rx_bytes - prev[0]) / dt   # RX
-                        io_write = (tx_bytes - prev[1]) / dt  # TX
-
-                elif sub_type == "gpu":
-                    gpu_idx = self._gpu_bdf_map.get(address)
-                    if gpu_idx is not None and gpu_idx in gpu_pcie:
-                        io_read, io_write = gpu_pcie[gpu_idx]
+            elif sub_type == "gpu":
+                gpu_idx = self._gpu_bdf_map.get(address)
+                if gpu_idx is not None and gpu_idx in gpu_pcie:
+                    io_read, io_write = gpu_pcie[gpu_idx]
 
             devices.append(PcieDeviceInfo(
                 address=address,
@@ -441,7 +519,6 @@ class PcieCollector:
                 io_label=io_label,
             ))
 
-        # 前回値を保存
         self._prev_disk = curr_disk
         self._prev_net = curr_net
         self._prev_time = now

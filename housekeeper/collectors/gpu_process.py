@@ -32,9 +32,10 @@ class GpuProcessInfo:
 
 def _read_cmdline(pid: int) -> str:
     try:
-        data = Path(f"/proc/{pid}/cmdline").read_text()
+        with open(f"/proc/{pid}/cmdline") as f:
+            data = f.read()
         return data.replace("\0", " ").strip()
-    except (FileNotFoundError, PermissionError):
+    except (FileNotFoundError, PermissionError, OSError):
         return ""
 
 
@@ -105,13 +106,80 @@ def _friendly_name(cmdline: str, raw_name: str) -> str:
 
 
 class GpuProcessCollector:
-    """GPU プロセスコレクター (NVIDIA)。"""
+    """GPU プロセスコレクター (NVIDIA)。
+
+    pynvml API 優先 (subprocess 不要で高速)、フォールバックで nvidia-smi。
+    """
 
     def __init__(self) -> None:
         self._uuid_to_index: dict[str, int] = {}
+        self._pynvml = None
+        self._nvml_handles: list | None = None  # None=未初期化
+        self._use_nvml: bool | None = None
 
     def available(self) -> bool:
         return bool(shutil.which("nvidia-smi"))
+
+    def _init_nvml(self) -> bool:
+        """pynvml を初期化してハンドルをキャッシュ。"""
+        try:
+            import pynvml  # type: ignore[import-untyped]
+            pynvml.nvmlInit()
+            count = pynvml.nvmlDeviceGetCount()
+            self._nvml_handles = [
+                pynvml.nvmlDeviceGetHandleByIndex(i) for i in range(count)
+            ]
+            self._pynvml = pynvml
+            self._use_nvml = True
+            return True
+        except Exception:
+            self._use_nvml = False
+            return False
+
+    def _collect_nvml(self) -> list[GpuProcessInfo]:
+        """pynvml API でプロセス情報を取得。"""
+        pynvml = self._pynvml
+        processes: list[GpuProcessInfo] = []
+
+        try:
+            for gpu_idx, handle in enumerate(self._nvml_handles):
+                try:
+                    procs = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
+                except pynvml.NVMLError:
+                    procs = []
+                try:
+                    gfx_procs = pynvml.nvmlDeviceGetGraphicsRunningProcesses(handle)
+                except pynvml.NVMLError:
+                    gfx_procs = []
+
+                seen_pids: set[int] = set()
+                for p in list(procs) + list(gfx_procs):
+                    if p.pid in seen_pids:
+                        continue
+                    seen_pids.add(p.pid)
+                    mem_mib = (p.usedGpuMemory or 0) / (1024 * 1024)
+                    cmdline = _read_cmdline(p.pid)
+                    raw_name = ""
+                    try:
+                        raw_name = os.path.basename(
+                            Path(f"/proc/{p.pid}/exe").resolve().name
+                        )
+                    except (OSError, PermissionError):
+                        pass
+                    friendly = _friendly_name(cmdline, raw_name)
+                    processes.append(GpuProcessInfo(
+                        pid=p.pid,
+                        gpu_index=gpu_idx,
+                        name=friendly,
+                        cmdline=cmdline,
+                        gpu_mem_mib=mem_mib,
+                    ))
+        except Exception:
+            self._use_nvml = False
+            return self._collect_nvidia_smi()
+
+        processes.sort(key=lambda p: p.gpu_mem_mib, reverse=True)
+        return processes
 
     def _build_uuid_map(self) -> None:
         """GPU UUID → インデックスのマッピングを構築。"""
@@ -128,7 +196,8 @@ class GpuProcessCollector:
         except (subprocess.TimeoutExpired, FileNotFoundError):
             pass
 
-    def collect(self) -> list[GpuProcessInfo]:
+    def _collect_nvidia_smi(self) -> list[GpuProcessInfo]:
+        """nvidia-smi フォールバック。"""
         if not shutil.which("nvidia-smi"):
             return []
 
@@ -179,6 +248,14 @@ class GpuProcessCollector:
                 gpu_mem_mib=mem,
             ))
 
-        # VRAM使用量でソート
         processes.sort(key=lambda p: p.gpu_mem_mib, reverse=True)
         return processes
+
+    def collect(self) -> list[GpuProcessInfo]:
+        if self._use_nvml is None:
+            self._init_nvml()
+
+        if self._use_nvml:
+            return self._collect_nvml()
+
+        return self._collect_nvidia_smi()

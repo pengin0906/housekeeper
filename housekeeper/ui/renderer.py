@@ -78,15 +78,30 @@ class Renderer:
         self.show_raid_members = False
         self.show_bond_members = False
         self.show_disks = True
+        self.show_nfs = True
         self.show_temperatures = True
         self.show_networks = True
         self.show_gpus = True
         self.show_help = False
+        self.temp_unit: str = "C"  # "C" or "F"
         # 自動スケール用ピーク値 (減衰付き)
         self._peak_disk_bps: float = 1_000.0
         self._peak_net_bps: float = 1_000.0
         self._peak_nfs_bps: float = 1_000.0
         self._peak_pcie_bps: float = 1_000.0
+
+    def _fmt_temp(self, temp_c: float, crit_c: float = 0.0) -> str:
+        """温度を現在の単位でフォーマット。"""
+        if self.temp_unit == "F":
+            t = temp_c * 9.0 / 5.0 + 32
+            s = f"{t:.0f}F"
+            if crit_c > 0:
+                s += f"/{crit_c * 9.0 / 5.0 + 32:.0f}F"
+            return s
+        s = f"{temp_c:.0f}C"
+        if crit_c > 0:
+            s += f"/{crit_c:.0f}C"
+        return s
 
     def render(
         self,
@@ -152,7 +167,7 @@ class Renderer:
             y = self._render_networks(win, y, x, width, label_w, val_w, networks)
 
         # NFS/SAN/NAS
-        if nfs_mounts:
+        if self.show_nfs and nfs_mounts:
             y = self._render_nfs(win, y, x, width, label_w, val_w, nfs_mounts)
 
         # Temperature (hwmon + GPU)
@@ -195,7 +210,7 @@ class Renderer:
 
         # フッター
         if y < max_y - 1:
-            footer = " h:help  q:quit  c:cores  d:raid/bond  i:disk  t:temp  n:net  g:gpu  p:pcie  +/-:interval "
+            footer = " h:help  q:quit  c:cores  d:raid/bond  i:disk  s:nfs  t:temp  n:net  g:gpu  p:pcie  f:°C/°F  +/-:interval "
             try:
                 win.addnstr(max_y - 1, x, footer[:width], width,
                              curses.color_pair(PAIR_HEADER) | curses.A_DIM)
@@ -468,9 +483,7 @@ class Renderer:
             color = PAIR_GPU_TEMP if temp > crit * 0.8 else PAIR_GPU_UTIL
 
             label = dev.display_name[:label_w]
-            val = f"{temp:.0f}C"
-            if dev.primary_crit_c > 0:
-                val += f"/{crit:.0f}C"
+            val = self._fmt_temp(temp, dev.primary_crit_c)
 
             draw_bar(win, y, x, width,
                      [BarSegment(frac, color)],
@@ -508,7 +521,7 @@ class Renderer:
                 draw_bar(win, y, x, width,
                          [BarSegment(frac, color)],
                          label=f"GPU{g.index}", label_width=label_w,
-                         value_text=f"{temp:.0f}C",
+                         value_text=self._fmt_temp(temp),
                          value_width=val_w + 4, label_color=PAIR_LABEL)
                 y += 1
 
@@ -523,7 +536,7 @@ class Renderer:
                 draw_bar(win, y, x, width,
                          [BarSegment(frac, color)],
                          label=f"AMD{g.index}", label_width=label_w,
-                         value_text=f"{temp:.0f}C",
+                         value_text=self._fmt_temp(temp),
                          value_width=val_w + 4, label_color=PAIR_LABEL)
                 y += 1
 
@@ -538,7 +551,7 @@ class Renderer:
                 draw_bar(win, y, x, width,
                          [BarSegment(frac, color)],
                          label=f"HL{d.index}", label_width=label_w,
-                         value_text=f"{temp:.0f}C",
+                         value_text=self._fmt_temp(temp),
                          value_width=val_w + 4, label_color=PAIR_LABEL)
                 y += 1
 
@@ -637,7 +650,7 @@ class Renderer:
                 draw_bar(win, y, x, width,
                          [BarSegment(temp_frac, PAIR_GPU_TEMP)],
                          label=f"{name} TEMP", label_width=label_w,
-                         value_text=f"{gpu.temperature_c:.0f}C",
+                         value_text=self._fmt_temp(gpu.temperature_c),
                          value_width=val_w, label_color=PAIR_LABEL)
                 y += 1
 
@@ -695,7 +708,7 @@ class Renderer:
                 draw_bar(win, y, x, width,
                          [BarSegment(temp_frac, PAIR_GPU_TEMP)],
                          label=f"{name} TEMP", label_width=label_w,
-                         value_text=f"{gpu.temperature_c:.0f}C",
+                         value_text=self._fmt_temp(gpu.temperature_c),
                          value_width=val_w, label_color=PAIR_LABEL)
                 y += 1
 
@@ -747,7 +760,7 @@ class Renderer:
                 draw_bar(win, y, x, width,
                          [BarSegment(temp_frac, PAIR_GPU_TEMP)],
                          label=f"{name} TEMP", label_width=label_w,
-                         value_text=f"{dev.temperature_c:.0f}C",
+                         value_text=self._fmt_temp(dev.temperature_c),
                          value_width=val_w, label_color=PAIR_LABEL)
                 y += 1
 
@@ -819,10 +832,12 @@ class Renderer:
             "  c        Toggle per-core CPU",
             "  d        Toggle RAID/Bond members",
             "  i        Toggle Disk I/O",
+            "  s        Toggle NFS/SAN/NAS",
             "  t        Toggle temperature",
             "  n        Toggle network",
             "  g        Toggle GPU",
             "  p        Toggle PCIe devices",
+            "  f        Toggle °C / °F",
             "  +/-      Change update interval",
             "",
             "  Press h to close",

@@ -174,39 +174,64 @@ class NfsMountCollector:
             pass
         return mounts
 
+    # データI/O操作のみ追跡 (メタデータ ops はノイズになるため除外)
+    # Read 系: bytes_recv を加算
+    _READ_OPS = frozenset({"READ:", "READDIR:", "READDIRPLUS:", "READLINK:"})
+    # Write 系: bytes_sent を加算
+    _WRITE_OPS = frozenset({"WRITE:", "COMMIT:"})
+
     def _read_mountstats(self, mounts: list[NfsMountInfo]) -> None:
-        """NFS マウントの /proc/self/mountstats から I/O 統計を読み取る。"""
+        """NFS マウントの /proc/self/mountstats から I/O 統計を読み取る。
+
+        per-op 統計はシステム全体 (bytes: 行はプロセスごとなので不可)。
+        データI/O操作 (READ/WRITE/READDIR等) のみ追跡。
+        GETATTR/ACCESS/LOOKUP 等のメタデータはバー表示のノイズになるため除外。
+
+        各 per-op 行フォーマット:
+          OP: ops transmissions timeouts bytes_sent bytes_recv ...
+        """
         if not _IS_LINUX:
             return
         try:
-            content = Path("/proc/self/mountstats").read_text()
+            with open("/proc/self/mountstats") as f:
+                content = f.read()
         except (OSError, PermissionError):
             return
 
         mount_map = {m.mount_point: m for m in mounts}
         current_mount: NfsMountInfo | None = None
+        in_per_op = False
 
         for line in content.splitlines():
             stripped = line.strip()
 
             if stripped.startswith("device "):
+                in_per_op = False
+                current_mount = None
                 parts = stripped.split()
-                # "device server:/path mounted on /mnt/xxx with fstype nfs4"
                 for i, p in enumerate(parts):
                     if p == "on" and i + 1 < len(parts):
                         mp = parts[i + 1]
                         current_mount = mount_map.get(mp)
                         break
 
-            elif current_mount and "READ:" in stripped:
-                pass  # ops は次の行に
-            elif current_mount and stripped.startswith("bytes:"):
+            elif current_mount and stripped.startswith("RPC iostats"):
+                in_per_op = True
+
+            elif current_mount and in_per_op and stripped.startswith("xprt:"):
+                pass
+
+            elif current_mount and in_per_op:
                 parts = stripped.split()
-                try:
-                    current_mount.read_bytes = int(parts[1])
-                    current_mount.write_bytes = int(parts[2])
-                except (IndexError, ValueError):
-                    pass
+                if len(parts) >= 6:
+                    op = parts[0]
+                    try:
+                        if op in self._READ_OPS:
+                            current_mount.read_bytes += int(parts[5])  # bytes_recv
+                        elif op in self._WRITE_OPS:
+                            current_mount.write_bytes += int(parts[4])  # bytes_sent
+                    except (ValueError, IndexError):
+                        pass
 
     def collect(self) -> list[NfsMountUsage]:
         now = time.monotonic()

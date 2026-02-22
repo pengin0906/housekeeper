@@ -29,6 +29,9 @@ class GpuUsage:
     mem_used_mib: float = 0.0       # VRAM 使用量
     mem_total_mib: float = 0.0      # VRAM 総量
     temperature_c: float = 0.0      # 温度
+    temp_slowdown_c: float = 0.0    # スロットリング温度
+    temp_shutdown_c: float = 0.0    # シャットダウン温度
+    temp_max_c: float = 0.0         # 最大動作温度
     power_draw_w: float = 0.0       # 現在の消費電力
     power_limit_w: float = 0.0      # 電力上限
     fan_speed_pct: float = 0.0      # ファン速度
@@ -54,82 +57,14 @@ class GpuUsage:
 
 
 def _try_nvml() -> list[GpuUsage] | None:
-    """pynvml を使った収集を試みる。なければ None。"""
+    """pynvml が利用可能か確認だけ行う (初回チェック用)。"""
     try:
         import pynvml  # type: ignore[import-untyped]
-    except ImportError:
-        return None
-
-    try:
         pynvml.nvmlInit()
-    except pynvml.NVMLError:
+        pynvml.nvmlShutdown()
+        return []  # 利用可能を示す (空リスト)
+    except (ImportError, Exception):
         return None
-
-    try:
-        count = pynvml.nvmlDeviceGetCount()
-        gpus: list[GpuUsage] = []
-
-        for i in range(count):
-            handle = pynvml.nvmlDeviceGetHandleByIndex(i)
-            name = pynvml.nvmlDeviceGetName(handle)
-            if isinstance(name, bytes):
-                name = name.decode()
-
-            util = pynvml.nvmlDeviceGetUtilizationRates(handle)
-            mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-
-            try:
-                temp = pynvml.nvmlDeviceGetTemperature(
-                    handle, pynvml.NVML_TEMPERATURE_GPU
-                )
-            except pynvml.NVMLError:
-                temp = 0
-
-            try:
-                power = pynvml.nvmlDeviceGetPowerUsage(handle) / 1000.0  # mW -> W
-            except pynvml.NVMLError:
-                power = 0.0
-
-            try:
-                power_limit = pynvml.nvmlDeviceGetPowerManagementLimit(handle) / 1000.0
-            except pynvml.NVMLError:
-                power_limit = 0.0
-
-            try:
-                fan = pynvml.nvmlDeviceGetFanSpeed(handle)
-            except pynvml.NVMLError:
-                fan = 0
-
-            try:
-                enc_util, _ = pynvml.nvmlDeviceGetEncoderUtilization(handle)
-            except pynvml.NVMLError:
-                enc_util = 0
-
-            try:
-                dec_util, _ = pynvml.nvmlDeviceGetDecoderUtilization(handle)
-            except pynvml.NVMLError:
-                dec_util = 0
-
-            gpus.append(GpuUsage(
-                index=i,
-                name=name,
-                gpu_util_pct=float(util.gpu),
-                mem_used_mib=mem_info.used / (1024 * 1024),
-                mem_total_mib=mem_info.total / (1024 * 1024),
-                temperature_c=float(temp),
-                power_draw_w=power,
-                power_limit_w=power_limit,
-                fan_speed_pct=float(fan),
-                encoder_util_pct=float(enc_util),
-                decoder_util_pct=float(dec_util),
-            ))
-
-        return gpus
-    finally:
-        try:
-            pynvml.nvmlShutdown()
-        except Exception:
-            pass
 
 
 def _try_nvidia_smi() -> list[GpuUsage] | None:
@@ -208,29 +143,137 @@ class GpuCollector:
 
     pynvml > nvidia-smi の順にフォールバックする。
     GPU が見つからない場合は空リストを返す。
+    pynvml はハンドルを永続的にキャッシュして Init/Shutdown のオーバーヘッドを回避。
     """
 
     def __init__(self) -> None:
         self._use_nvml: bool | None = None  # None = 未判定
+        self._nvml_ok = False
+        self._handles: list = []
+        self._names: list[str] = []
+        self._power_limits: list[float] = []
+        self._temp_thresholds: list[tuple[float, float, float]] = []  # (max, slowdown, shutdown)
+        self._pynvml = None  # モジュール参照
 
     def available(self) -> bool:
         """GPU モニタリングが利用可能か。"""
         return bool(shutil.which("nvidia-smi"))
 
-    def collect(self) -> list[GpuUsage]:
-        # まだ判定してなければ nvml を試す
-        if self._use_nvml is None:
-            result = _try_nvml()
-            if result is not None:
-                self._use_nvml = True
-                return result
+    def _init_nvml(self) -> bool:
+        """pynvml を初期化してハンドルをキャッシュ。"""
+        try:
+            import pynvml  # type: ignore[import-untyped]
+            pynvml.nvmlInit()
+            count = pynvml.nvmlDeviceGetCount()
+            handles = []
+            names = []
+            power_limits = []
+            temp_thresholds = []
+            for i in range(count):
+                h = pynvml.nvmlDeviceGetHandleByIndex(i)
+                handles.append(h)
+                n = pynvml.nvmlDeviceGetName(h)
+                if isinstance(n, bytes):
+                    n = n.decode()
+                names.append(n)
+                try:
+                    pl = pynvml.nvmlDeviceGetPowerManagementLimit(h) / 1000.0
+                except pynvml.NVMLError:
+                    pl = 0.0
+                power_limits.append(pl)
+                # 温度閾値取得
+                t_max = t_slow = t_shut = 0.0
+                try:
+                    t_max = float(pynvml.nvmlDeviceGetTemperatureThreshold(
+                        h, pynvml.NVML_TEMPERATURE_THRESHOLD_GPU_MAX))
+                except (pynvml.NVMLError, Exception):
+                    pass
+                try:
+                    t_slow = float(pynvml.nvmlDeviceGetTemperatureThreshold(
+                        h, pynvml.NVML_TEMPERATURE_THRESHOLD_SLOWDOWN))
+                except (pynvml.NVMLError, Exception):
+                    pass
+                try:
+                    t_shut = float(pynvml.nvmlDeviceGetTemperatureThreshold(
+                        h, pynvml.NVML_TEMPERATURE_THRESHOLD_SHUTDOWN))
+                except (pynvml.NVMLError, Exception):
+                    pass
+                temp_thresholds.append((t_max, t_slow, t_shut))
+            self._pynvml = pynvml
+            self._handles = handles
+            self._names = names
+            self._power_limits = power_limits
+            self._temp_thresholds = temp_thresholds
+            self._nvml_ok = True
+            self._use_nvml = True
+            return True
+        except Exception:
             self._use_nvml = False
+            self._nvml_ok = False
+            return False
 
-        if self._use_nvml:
-            result = _try_nvml()
-            if result is not None:
-                return result
-            # nvml が壊れたらフォールバック
+    def _collect_nvml(self) -> list[GpuUsage]:
+        """キャッシュ済みハンドルで高速に収集。"""
+        pynvml = self._pynvml
+        gpus: list[GpuUsage] = []
+        try:
+            for i, handle in enumerate(self._handles):
+                util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+
+                try:
+                    temp = pynvml.nvmlDeviceGetTemperature(
+                        handle, pynvml.NVML_TEMPERATURE_GPU)
+                except pynvml.NVMLError:
+                    temp = 0
+                try:
+                    power = pynvml.nvmlDeviceGetPowerUsage(handle) / 1000.0
+                except pynvml.NVMLError:
+                    power = 0.0
+                try:
+                    fan = pynvml.nvmlDeviceGetFanSpeed(handle)
+                except pynvml.NVMLError:
+                    fan = 0
+                try:
+                    enc_util, _ = pynvml.nvmlDeviceGetEncoderUtilization(handle)
+                except pynvml.NVMLError:
+                    enc_util = 0
+                try:
+                    dec_util, _ = pynvml.nvmlDeviceGetDecoderUtilization(handle)
+                except pynvml.NVMLError:
+                    dec_util = 0
+
+                t_max, t_slow, t_shut = (
+                    self._temp_thresholds[i]
+                    if i < len(self._temp_thresholds) else (0.0, 0.0, 0.0))
+                gpus.append(GpuUsage(
+                    index=i,
+                    name=self._names[i],
+                    gpu_util_pct=float(util.gpu),
+                    mem_used_mib=mem_info.used / (1024 * 1024),
+                    mem_total_mib=mem_info.total / (1024 * 1024),
+                    temperature_c=float(temp),
+                    temp_slowdown_c=t_slow,
+                    temp_shutdown_c=t_shut,
+                    temp_max_c=t_max,
+                    power_draw_w=power,
+                    power_limit_w=self._power_limits[i],
+                    fan_speed_pct=float(fan),
+                    encoder_util_pct=float(enc_util),
+                    decoder_util_pct=float(dec_util),
+                ))
+            return gpus
+        except Exception:
+            # NVML がクラッシュしたらフォールバック
+            self._nvml_ok = False
             self._use_nvml = False
+            return _try_nvidia_smi() or []
+
+    def collect(self) -> list[GpuUsage]:
+        if self._use_nvml is None:
+            self._init_nvml()
+
+        if self._use_nvml and self._nvml_ok:
+            return self._collect_nvml()
 
         return _try_nvidia_smi() or []
