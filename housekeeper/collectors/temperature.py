@@ -23,6 +23,8 @@ from pathlib import Path
 
 
 _IS_LINUX = sys.platform.startswith("linux")
+_IS_DARWIN = sys.platform == "darwin"
+_IS_WIN = sys.platform == "win32"
 
 # hwmon ドライバ名からカテゴリへのマッピング
 _DRIVER_CATEGORY: dict[str, str] = {
@@ -304,6 +306,10 @@ class TemperatureCollector:
         return result
 
     def collect(self) -> list[TempDevice]:
+        if _IS_DARWIN:
+            return self._collect_darwin()
+        if _IS_WIN:
+            return self._collect_win()
         if not _IS_LINUX:
             return []
 
@@ -511,3 +517,164 @@ class TemperatureCollector:
 
         # メインスレッドに結果を渡す (次の collect() で回収)
         self._ipmi_pending = devices
+
+    # ─── macOS ───────────────────────────────────────────────
+
+    def _collect_darwin(self) -> list[TempDevice]:
+        """macOS: ioreg から Apple Silicon / Intel 温度センサーを取得。"""
+        now = time.monotonic()
+        if self._cache is not None and now - self._cache_time < 5.0:
+            return self._cache
+
+        devices: list[TempDevice] = []
+        sensors: list[TempSensor] = []
+
+        # Apple Silicon: ioreg で SOC サーマルセンサーを取得
+        try:
+            out = subprocess.run(
+                ["ioreg", "-r", "-c", "AppleAPCIoThermometer", "-d", "1"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if out.returncode == 0:
+                sensors.extend(self._parse_ioreg_temp(out.stdout, "SOC"))
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+        # Intel Mac: SMC ベースの温度 (ioreg から AppleSMC)
+        if not sensors:
+            try:
+                out = subprocess.run(
+                    ["ioreg", "-r", "-c", "AppleSMC", "-d", "1"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if out.returncode == 0:
+                    sensors.extend(self._parse_ioreg_temp(out.stdout, "CPU"))
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+
+        # powermetrics フォールバック (sudo 不要で失敗する場合は空)
+        if not sensors:
+            try:
+                out = subprocess.run(
+                    ["sudo", "-n", "powermetrics", "--samplers", "smc",
+                     "-i", "1", "-n", "1"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if out.returncode == 0:
+                    for line in out.stdout.splitlines():
+                        if "die temperature" in line.lower():
+                            try:
+                                val = float(line.split(":")[1].strip().split()[0])
+                                sensors.append(TempSensor(label="CPU die", temp_c=val))
+                            except (ValueError, IndexError):
+                                pass
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+
+        if sensors:
+            devices.append(TempDevice(
+                name="apple_smc", category="CPU",
+                sensors=sensors,
+            ))
+
+        # ファン: ioreg から AppleFanCtrl
+        fans: list[FanSensor] = []
+        try:
+            out = subprocess.run(
+                ["ioreg", "-r", "-c", "AppleSMCFanCtrl", "-d", "1"],
+                capture_output=True, text=True, timeout=3,
+            )
+            if out.returncode == 0:
+                for line in out.stdout.splitlines():
+                    if "CurrentSpeed" in line:
+                        try:
+                            rpm = int(line.split("=")[1].strip())
+                            fans.append(FanSensor(label="Fan", rpm=rpm))
+                        except (ValueError, IndexError):
+                            pass
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        if fans:
+            devices.append(TempDevice(
+                name="apple_fan", category="Fan",
+                fans=fans,
+            ))
+
+        self._cache = devices
+        self._cache_time = now
+        return devices
+
+    @staticmethod
+    def _parse_ioreg_temp(text: str, category: str) -> list[TempSensor]:
+        """ioreg 出力からTemperature/CurrentValue を抽出。"""
+        sensors: list[TempSensor] = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            # "Temperature" = 4215 (hundredths of degree C)
+            # or "CurrentValue" = 42.15
+            for key in ("Temperature", "CurrentValue", "temperature"):
+                if f'"{key}"' in stripped and "=" in stripped:
+                    try:
+                        val_str = stripped.split("=")[1].strip()
+                        val = float(val_str)
+                        # ioreg often returns hundredths of a degree
+                        if val > 200:
+                            val = val / 100.0
+                        if 0 < val < 150:
+                            sensors.append(TempSensor(
+                                label=f"{category} Temp", temp_c=val,
+                            ))
+                    except (ValueError, IndexError):
+                        pass
+        return sensors
+
+    # ─── Windows ─────────────────────────────────────────────
+
+    def _collect_win(self) -> list[TempDevice]:
+        """Windows: WMI MSAcpi_ThermalZoneTemperature で温度を取得。"""
+        now = time.monotonic()
+        if self._cache is not None and now - self._cache_time < 5.0:
+            return self._cache
+
+        devices: list[TempDevice] = []
+        sensors: list[TempSensor] = []
+
+        try:
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "Get-CimInstance MSAcpi_ThermalZoneTemperature"
+                 " -Namespace root/wmi -ErrorAction SilentlyContinue"
+                 " | Select-Object InstanceName,CurrentTemperature"
+                 " | ForEach-Object { $_.InstanceName + '|' + $_.CurrentTemperature }"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if out.returncode == 0:
+                for line in out.stdout.strip().splitlines():
+                    line = line.strip()
+                    if "|" not in line:
+                        continue
+                    parts = line.split("|")
+                    try:
+                        name = parts[0].strip()
+                        # WMI returns decikelvin (Kelvin × 10)
+                        kelvin10 = float(parts[1].strip())
+                        temp_c = kelvin10 / 10.0 - 273.15
+                        if 0 < temp_c < 150:
+                            label = "ACPI Zone"
+                            if "CPU" in name.upper() or "PROC" in name.upper():
+                                label = "CPU"
+                            sensors.append(TempSensor(label=label, temp_c=temp_c))
+                    except (ValueError, IndexError):
+                        pass
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+        if sensors:
+            devices.append(TempDevice(
+                name="wmi_acpi", category="CPU",
+                sensors=sensors,
+            ))
+
+        self._cache = devices
+        self._cache_time = now
+        return devices

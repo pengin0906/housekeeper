@@ -55,6 +55,7 @@ class SwapUsage:
 
 
 _IS_DARWIN = sys.platform == "darwin"
+_IS_WIN = sys.platform == "win32"
 
 
 class MemoryCollector:
@@ -63,6 +64,8 @@ class MemoryCollector:
     def _read_meminfo(self) -> dict[str, int]:
         if _IS_DARWIN:
             return self._read_meminfo_darwin()
+        if _IS_WIN:
+            return self._read_meminfo_win()
         return self._read_meminfo_linux()
 
     @staticmethod
@@ -159,6 +162,44 @@ class MemoryCollector:
         except (OSError, subprocess.TimeoutExpired, ValueError):
             pass
 
+        return info
+
+    @staticmethod
+    def _read_meminfo_win() -> dict[str, int]:
+        """Windows: ctypes GlobalMemoryStatusEx でメモリ情報を取得。"""
+        info: dict[str, int] = {}
+        try:
+            import ctypes
+
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            ms = MEMORYSTATUSEX()
+            ms.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(  # type: ignore[attr-defined]
+                ctypes.byref(ms)
+            ):
+                info["MemTotal"] = ms.ullTotalPhys // 1024
+                info["MemFree"] = ms.ullAvailPhys // 1024
+                info["Buffers"] = 0
+                info["Cached"] = 0
+                # Swap = PageFile - Physical (Windows page file includes phys mem)
+                swap_total = ms.ullTotalPageFile - ms.ullTotalPhys
+                swap_free = ms.ullAvailPageFile - ms.ullAvailPhys
+                info["SwapTotal"] = max(swap_total, 0) // 1024
+                info["SwapFree"] = max(swap_free, 0) // 1024
+        except (OSError, AttributeError):
+            pass
         return info
 
     def collect(self) -> tuple[MemoryUsage, SwapUsage]:

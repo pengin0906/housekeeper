@@ -46,6 +46,8 @@ class KernelInfo:
 
 
 _IS_DARWIN = sys.platform == "darwin"
+_IS_WIN = sys.platform == "win32"
+_IS_LINUX = sys.platform.startswith("linux")
 
 
 class KernelCollector:
@@ -60,29 +62,30 @@ class KernelCollector:
 
     @staticmethod
     def _read_kernel_version() -> str:
-        if _IS_DARWIN:
-            return platform.release()
-        try:
-            with open("/proc/version") as f:
-                parts = f.read().split()
-                return parts[2] if len(parts) > 2 else ""
-        except OSError:
-            return platform.release()
+        if _IS_LINUX:
+            try:
+                with open("/proc/version") as f:
+                    parts = f.read().split()
+                    return parts[2] if len(parts) > 2 else ""
+            except OSError:
+                pass
+        return platform.release()
 
     def collect(self) -> KernelInfo:
         now = time.monotonic()
         dt = now - self._prev_time if self._prev_time else 0.0
 
-        # Load average
+        # Load average (Linux/macOS only; Windows has no equivalent)
         load_1 = load_5 = load_15 = 0.0
         running = total = 0
-        try:
-            load_1, load_5, load_15 = os.getloadavg()
-        except OSError:
-            pass
+        if not _IS_WIN:
+            try:
+                load_1, load_5, load_15 = os.getloadavg()
+            except OSError:
+                pass
 
         # Running/total procs (Linux only from /proc/loadavg)
-        if not _IS_DARWIN:
+        if _IS_LINUX:
             try:
                 with open("/proc/loadavg") as f:
                     parts = f.read().split()
@@ -96,6 +99,8 @@ class KernelCollector:
         uptime = 0.0
         if _IS_DARWIN:
             uptime = self._read_uptime_darwin()
+        elif _IS_WIN:
+            uptime = self._read_uptime_win()
         else:
             try:
                 with open("/proc/uptime") as f:
@@ -106,7 +111,7 @@ class KernelCollector:
         # Context switches / interrupts (Linux only)
         ctxt = 0
         intr = 0
-        if not _IS_DARWIN:
+        if _IS_LINUX:
             try:
                 with open("/proc/stat") as f:
                     for line in f:
@@ -157,3 +162,13 @@ class KernelCollector:
         except (OSError, subprocess.TimeoutExpired, ValueError, IndexError):
             pass
         return 0.0
+
+    @staticmethod
+    def _read_uptime_win() -> float:
+        """Windows: ctypes GetTickCount64 でアップタイムを取得。"""
+        try:
+            import ctypes
+            ms = ctypes.windll.kernel32.GetTickCount64()  # type: ignore[attr-defined]
+            return ms / 1000.0
+        except (OSError, AttributeError):
+            return 0.0

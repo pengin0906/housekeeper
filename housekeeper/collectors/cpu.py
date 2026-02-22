@@ -3,6 +3,7 @@
 Linux: /proc/stat から累積 jiffies を読み取り、差分で使用率を計算。
 macOS: sysctl kern.cp_time (合計) + per-core は host_processor_info 相当を
        top コマンドで取得。
+Windows: PowerShell Get-Counter でプロセッサ使用率を取得。
 """
 
 from __future__ import annotations
@@ -53,6 +54,7 @@ class CpuUsage:
 
 
 _IS_DARWIN = sys.platform == "darwin"
+_IS_WIN = sys.platform == "win32"
 
 
 class CpuCollector:
@@ -64,6 +66,8 @@ class CpuCollector:
     def _read_stat(self) -> dict[str, CpuTimes]:
         if _IS_DARWIN:
             return self._read_stat_darwin()
+        if _IS_WIN:
+            return self._read_stat_win()
         return self._read_stat_linux()
 
     def _read_stat_linux(self) -> dict[str, CpuTimes]:
@@ -129,6 +133,27 @@ class CpuCollector:
             except (OSError, subprocess.TimeoutExpired, ValueError):
                 pass
 
+        return result
+
+    def _read_stat_win(self) -> dict[str, CpuTimes]:
+        """Windows: ctypes GetSystemTimes で累積 CPU ticks を取得。"""
+        result: dict[str, CpuTimes] = {}
+        try:
+            import ctypes
+            idle = ctypes.c_ulonglong()
+            kernel = ctypes.c_ulonglong()
+            user = ctypes.c_ulonglong()
+            if ctypes.windll.kernel32.GetSystemTimes(  # type: ignore[attr-defined]
+                ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user)
+            ):
+                # kernel には idle を含む → system = kernel - idle
+                result["cpu"] = CpuTimes(
+                    user=user.value,
+                    system=kernel.value - idle.value,
+                    idle=idle.value,
+                )
+        except (OSError, AttributeError):
+            pass
         return result
 
     def collect(self) -> list[CpuUsage]:

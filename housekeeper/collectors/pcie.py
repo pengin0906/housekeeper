@@ -460,6 +460,8 @@ class PcieCollector:
         return result
 
     def collect(self) -> list[PcieDeviceInfo]:
+        if _IS_DARWIN:
+            return self._collect_darwin()
         if not _IS_LINUX:
             return []
 
@@ -524,3 +526,53 @@ class PcieCollector:
         self._prev_time = now
 
         return devices
+
+    def _collect_darwin(self) -> list[PcieDeviceInfo]:
+        """macOS: system_profiler SPPCIDataType で PCIe デバイスを列挙。"""
+        if self._cached_devices is not None:
+            # 静的情報のみなので初回以降はキャッシュを返す
+            return [PcieDeviceInfo(
+                address=addr, name=name,
+                current_speed=cs, max_speed=ms,
+                current_width=cw, max_width=mw,
+                device_type=dt,
+            ) for addr, name, cs, ms, cw, mw, dt, _, _ in self._cached_devices]
+
+        try:
+            import json as _json
+            out = subprocess.run(
+                ["system_profiler", "SPPCIDataType", "-json"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if out.returncode != 0:
+                self._cached_devices = []
+                return []
+            data = _json.loads(out.stdout)
+            pci_items = data.get("SPPCIDataType", [])
+            devices: list[PcieDeviceInfo] = []
+            cache: list[tuple] = []
+            for i, item in enumerate(pci_items):
+                name = item.get("sppci_name", item.get("_name", "Unknown"))
+                link_speed = item.get("sppci_link_speed", "")
+                link_width = item.get("sppci_link_width", "")
+                # Parse "5.0 GT/s" → "5.0GT/s", "x4" → 4
+                speed = link_speed.replace(" ", "") if link_speed else ""
+                width_str = link_width.replace("x", "").strip() if link_width else "0"
+                try:
+                    width = int(width_str)
+                except ValueError:
+                    width = 0
+                addr = f"mac:{i}"
+                entry = (addr, name, speed, speed, width, width, "PCI", "", "")
+                cache.append(entry)
+                devices.append(PcieDeviceInfo(
+                    address=addr, name=name,
+                    current_speed=speed, max_speed=speed,
+                    current_width=width, max_width=width,
+                    device_type="PCI",
+                ))
+            self._cached_devices = cache
+            return devices
+        except (OSError, subprocess.TimeoutExpired, Exception):
+            self._cached_devices = []
+            return []

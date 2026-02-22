@@ -3,6 +3,8 @@
 取得戦略:
   1. pynvml (Python NVML バインディング) が利用可能ならそれを使用
   2. フォールバックとして nvidia-smi コマンドの CSV 出力をパース
+  3. macOS: system_profiler で GPU 名/VRAM を取得
+  4. Windows: WMI Win32_VideoController で非NVIDIA GPU の情報を取得
 
 取得するメトリクス:
   - GPU 使用率 (%)
@@ -17,7 +19,11 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass, field
+
+_IS_DARWIN = sys.platform == "darwin"
+_IS_WIN = sys.platform == "win32"
 
 
 @dataclass
@@ -276,4 +282,85 @@ class GpuCollector:
         if self._use_nvml and self._nvml_ok:
             return self._collect_nvml()
 
-        return _try_nvidia_smi() or []
+        result = _try_nvidia_smi()
+        if result:
+            return result
+
+        # NVIDIA 以外: macOS/Windows で基本 GPU 情報を取得
+        if _IS_DARWIN:
+            return _try_macos_gpu()
+        if _IS_WIN:
+            return _try_win_gpu()
+
+        return []
+
+
+def _try_macos_gpu() -> list[GpuUsage]:
+    """macOS: system_profiler で GPU 名と VRAM を取得。"""
+    try:
+        import json as _json
+        out = subprocess.run(
+            ["system_profiler", "SPDisplaysDataType", "-json"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if out.returncode != 0:
+            return []
+        data = _json.loads(out.stdout)
+        displays = data.get("SPDisplaysDataType", [])
+        gpus: list[GpuUsage] = []
+        for i, d in enumerate(displays):
+            name = d.get("sppci_model", d.get("_name", "Unknown"))
+            vram_str = d.get("spdisplays_vram", "0")
+            # "1536 MB" or "16 GB"
+            vram_mib = 0.0
+            try:
+                parts = vram_str.split()
+                val = float(parts[0])
+                if len(parts) > 1 and parts[1].upper().startswith("G"):
+                    vram_mib = val * 1024
+                else:
+                    vram_mib = val
+            except (ValueError, IndexError):
+                pass
+            gpus.append(GpuUsage(
+                index=i, name=name,
+                mem_total_mib=vram_mib,
+            ))
+        return gpus
+    except (OSError, subprocess.TimeoutExpired, Exception):
+        return []
+
+
+def _try_win_gpu() -> list[GpuUsage]:
+    """Windows: WMI Win32_VideoController で非NVIDIA GPU 情報を取得。"""
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-CimInstance Win32_VideoController"
+             " | ForEach-Object { $_.Name + '|' + $_.AdapterRAM }"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if out.returncode != 0:
+            return []
+        gpus: list[GpuUsage] = []
+        for i, line in enumerate(out.stdout.strip().splitlines()):
+            line = line.strip()
+            if "|" not in line:
+                continue
+            parts = line.split("|")
+            name = parts[0].strip()
+            try:
+                adapter_ram = int(parts[1].strip())
+                vram_mib = adapter_ram / (1024 * 1024)
+            except (ValueError, IndexError):
+                vram_mib = 0.0
+            # Skip Microsoft Basic Display Adapter
+            if "basic" in name.lower():
+                continue
+            gpus.append(GpuUsage(
+                index=i, name=name,
+                mem_total_mib=vram_mib,
+            ))
+        return gpus
+    except (OSError, subprocess.TimeoutExpired):
+        return []
