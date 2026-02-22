@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68.0", "setuptools-scm>=8.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "housekeeper"
+version = "0.1.0"
+description = "xosview-like system monitor with GPU/PCIe/NFS/Temperature support"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [{ name = "pengin0906" }]
+keywords = ["system-monitor", "nvidia", "gpu", "xosview", "tui", "temperature", "pcie"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console :: Curses",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Monitoring",
+]
+
+[project.scripts]
+housekeeper = "housekeeper.main:main"
+
+[project.optional-dependencies]
+nvml = ["pynvml>=11.5.0"]
