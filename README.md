@@ -20,15 +20,10 @@
 ## インストール
 
 ```bash
-# リポジトリをクローン
-git clone <url>
+git clone https://github.com/pengin0906/housekeeper.git
 cd housekeeper
-
-# editable install
 pip install -e .
-
-# または直接実行
-python -m housekeeper.main
+housekeeper --gui
 ```
 
 ## 使い方

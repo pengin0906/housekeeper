@@ -295,8 +295,48 @@ class GpuCollector:
         return []
 
 
+def _parse_ioreg_perf_stats() -> dict[str, int]:
+    """ioreg IOAccelerator から PerformanceStatistics を取得 (sudo不要)。"""
+    import re as _re
+    try:
+        out = subprocess.run(
+            ["ioreg", "-r", "-d", "1", "-w", "0", "-c", "IOAccelerator"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if out.returncode != 0:
+            return {}
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+
+    result: dict[str, int] = {}
+    in_perf = False
+    depth = 0
+    for line in out.stdout.splitlines():
+        s = line.strip()
+        if '"PerformanceStatistics"' in s:
+            in_perf = True
+            depth = 0
+            continue
+        if in_perf:
+            depth += s.count("{") - s.count("}")
+            if depth < 0:
+                break  # 最初のデバイスのみ
+            for key in ("Device Utilization %", "Renderer Utilization %",
+                        "Tiler Utilization %", "Alloc system memory",
+                        "In use system memory", "GPU Activity(%)"):
+                if f'"{key}"' in s:
+                    m = _re.search(r"=\s*(\d+)", s)
+                    if m:
+                        result[key] = int(m.group(1))
+    return result
+
+
 def _try_macos_gpu() -> list[GpuUsage]:
-    """macOS: system_profiler で GPU 名と VRAM を取得。"""
+    """macOS: system_profiler + ioreg で GPU 名/VRAM/使用率を取得。
+
+    Apple Silicon (M1/M2/M3/M4): ioreg IOAccelerator から
+    GPU使用率、メモリ使用量をリアルタイム取得 (sudo不要)。
+    """
     try:
         import json as _json
         out = subprocess.run(
@@ -307,25 +347,68 @@ def _try_macos_gpu() -> list[GpuUsage]:
             return []
         data = _json.loads(out.stdout)
         displays = data.get("SPDisplaysDataType", [])
-        gpus: list[GpuUsage] = []
-        for i, d in enumerate(displays):
-            name = d.get("sppci_model", d.get("_name", "Unknown"))
-            vram_str = d.get("spdisplays_vram", "0")
-            # "1536 MB" or "16 GB"
-            vram_mib = 0.0
+        if not displays:
+            return []
+
+        # 基本情報 (名前・VRAM)
+        d = displays[0]
+        name = d.get("sppci_model", d.get("_name", "Unknown"))
+        vram_str = d.get("spdisplays_vram", "0")
+        vram_mib = 0.0
+        try:
+            parts = vram_str.split()
+            val = float(parts[0])
+            if len(parts) > 1 and parts[1].upper().startswith("G"):
+                vram_mib = val * 1024
+            else:
+                vram_mib = val
+        except (ValueError, IndexError):
+            pass
+
+        # Apple Silicon: ioreg からリアルタイムメトリクス取得
+        perf = _parse_ioreg_perf_stats()
+        gpu_util = float(perf.get("Device Utilization %",
+                                   perf.get("GPU Activity(%)", 0)))
+        alloc_mem = perf.get("Alloc system memory", 0)
+        inuse_mem = perf.get("In use system memory", 0)
+        # メモリ: In use があればそれ、なければ Alloc を使用
+        mem_used_mib = (inuse_mem or alloc_mem) / (1024 * 1024)
+        # VRAM 総量が system_profiler から取れない場合 (Apple Silicon UMA)
+        # → sysctl で物理メモリ総量を取得
+        if vram_mib == 0:
             try:
-                parts = vram_str.split()
-                val = float(parts[0])
-                if len(parts) > 1 and parts[1].upper().startswith("G"):
-                    vram_mib = val * 1024
+                out2 = subprocess.run(
+                    ["sysctl", "-n", "hw.memsize"],
+                    capture_output=True, text=True, timeout=3,
+                )
+                if out2.returncode == 0:
+                    vram_mib = int(out2.stdout.strip()) / (1024 * 1024)
+            except (OSError, subprocess.TimeoutExpired, ValueError):
+                pass
+
+        gpus = [GpuUsage(
+            index=0, name=name,
+            gpu_util_pct=gpu_util,
+            mem_used_mib=mem_used_mib,
+            mem_total_mib=vram_mib,
+        )]
+
+        # 複数GPU (外付けeGPU等)
+        for i, dd in enumerate(displays[1:], 1):
+            n = dd.get("sppci_model", dd.get("_name", "Unknown"))
+            vs = dd.get("spdisplays_vram", "0")
+            vm = 0.0
+            try:
+                pp = vs.split()
+                v = float(pp[0])
+                if len(pp) > 1 and pp[1].upper().startswith("G"):
+                    vm = v * 1024
                 else:
-                    vram_mib = val
+                    vm = v
             except (ValueError, IndexError):
                 pass
-            gpus.append(GpuUsage(
-                index=i, name=name,
-                mem_total_mib=vram_mib,
-            ))
+            gpus.append(GpuUsage(index=i, name=n, mem_total_mib=vm))
+
         return gpus
     except (OSError, subprocess.TimeoutExpired, Exception):
         return []

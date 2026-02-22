@@ -318,9 +318,13 @@ class HousekeeperGui:
         self.nvidia_col = self.amd_col = self.gaudi_col = None
         self.gpu_proc_col = self.pcie_col = self.nfs_col = None
 
+        import sys as _sys2
         if accel["nvidia"] and not self.args.no_gpu:
             self.nvidia_col = _lazy_import("housekeeper.collectors.gpu", "GpuCollector")()
             self.gpu_proc_col = _lazy_import("housekeeper.collectors.gpu_process", "GpuProcessCollector")()
+        elif _sys2.platform == "darwin" and not self.args.no_gpu:
+            # Apple Silicon GPU (ioreg IOAccelerator)
+            self.nvidia_col = _lazy_import("housekeeper.collectors.gpu", "GpuCollector")()
         if accel["amd"] and not self.args.no_gpu:
             self.amd_col = _lazy_import("housekeeper.collectors.amd_gpu", "AmdGpuCollector")()
         if accel["gaudi"] and not self.args.no_gpu:
