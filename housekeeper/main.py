@@ -33,21 +33,44 @@ def _detect_accelerators() -> dict[str, bool]:
 
 def _has_pcie_devices() -> bool:
     """PCIe デバイスが存在するか。"""
-    return Path("/sys/bus/pci/devices").exists()
+    if sys.platform.startswith("linux"):
+        return Path("/sys/bus/pci/devices").exists()
+    # macOS/Windows: PCIe情報は別の方法で取得するが、現状は非対応
+    return False
 
 
 def _has_net_mounts() -> bool:
     """NFS/CIFS 等のネットワークマウントがあるか。"""
     net_fs = {"nfs", "nfs4", "nfs3", "cifs", "smbfs", "glusterfs",
               "ceph", "lustre", "9p", "fuse.sshfs"}
-    try:
-        with open("/proc/mounts") as f:
-            for line in f:
-                parts = line.split()
-                if len(parts) >= 3 and parts[2] in net_fs:
-                    return True
-    except OSError:
-        pass
+    if sys.platform.startswith("linux"):
+        try:
+            with open("/proc/mounts") as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) >= 3 and parts[2] in net_fs:
+                        return True
+        except OSError:
+            pass
+    elif sys.platform == "darwin":
+        import subprocess
+        try:
+            out = subprocess.run(["mount"], capture_output=True, text=True, timeout=3)
+            if out.returncode == 0:
+                for line in out.stdout.splitlines():
+                    lower = line.lower()
+                    if "nfs" in lower or "smbfs" in lower or "cifs" in lower:
+                        return True
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    elif sys.platform == "win32":
+        import subprocess
+        try:
+            out = subprocess.run(["net", "use"], capture_output=True, text=True, timeout=5)
+            if out.returncode == 0 and ("OK" in out.stdout or "Disconnected" in out.stdout):
+                return True
+        except (OSError, subprocess.TimeoutExpired):
+            pass
     return False
 
 

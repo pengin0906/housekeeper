@@ -1,17 +1,15 @@
-"""Process collector - /proc を読み取ってトッププロセスを取得。
+"""Process collector - トッププロセスを取得。
 
-/proc/[pid]/stat と /proc/[pid]/cmdline から:
-  - CPU 使用率の高いプロセス
-  - メモリ使用量の高いプロセス
-を取得する。
-
-Claude Code, antigravity, python, node 等のプロセスを特定して
-わかりやすい名前で表示する。
+Linux: /proc/[pid]/stat + /proc/[pid]/cmdline
+macOS: ps -eo pid,pcpu,rss,comm
+Windows: PowerShell Get-Process
 """
 
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -50,6 +48,9 @@ _APP_NAMES: list[tuple[str, str]] = [
     ("npm ", "npm"),
     ("npx ", "npx"),
 ]
+
+_IS_DARWIN = sys.platform == "darwin"
+_IS_WIN = sys.platform == "win32"
 
 
 def _get_friendly_name(cmdline: str, comm: str) -> str:
@@ -121,8 +122,16 @@ class ProcessCollector:
         self.top_n = top_n
         self._prev: dict[int, _ProcStat] = {}
         self._prev_time: float = 0.0
-        self._clk_tck = os.sysconf("SC_CLK_TCK")
-        self._page_size = os.sysconf("SC_PAGE_SIZE")
+        if not _IS_WIN:
+            try:
+                self._clk_tck = os.sysconf("SC_CLK_TCK")
+                self._page_size = os.sysconf("SC_PAGE_SIZE")
+            except (ValueError, OSError):
+                self._clk_tck = 100
+                self._page_size = 4096
+        else:
+            self._clk_tck = 100
+            self._page_size = 4096
 
     def _read_proc(self, pid: int) -> _ProcStat | None:
         try:
@@ -153,6 +162,13 @@ class ProcessCollector:
             return ""
 
     def collect(self) -> list[ProcessInfo]:
+        if _IS_DARWIN:
+            return self._collect_darwin()
+        if _IS_WIN:
+            return self._collect_win()
+        return self._collect_linux()
+
+    def _collect_linux(self) -> list[ProcessInfo]:
         now = time.monotonic()
         dt = now - self._prev_time if self._prev_time else 0.0
 
@@ -195,5 +211,81 @@ class ProcessCollector:
         self._prev_time = now
 
         # CPU 使用率でソートして上位 N 件
+        processes.sort(key=lambda p: p.cpu_pct, reverse=True)
+        return processes[:self.top_n]
+
+    def _collect_darwin(self) -> list[ProcessInfo]:
+        """macOS: ps でプロセス情報を取得。"""
+        processes: list[ProcessInfo] = []
+        try:
+            out = subprocess.run(
+                ["ps", "-eo", "pid,%cpu,rss,comm"],
+                capture_output=True, text=True, timeout=3,
+            )
+            if out.returncode != 0:
+                return []
+            for line in out.stdout.splitlines()[1:]:
+                parts = line.split(None, 3)
+                if len(parts) < 4:
+                    continue
+                try:
+                    pid = int(parts[0])
+                    cpu_pct = float(parts[1])
+                    rss_kb = int(parts[2])
+                    comm = parts[3].strip()
+                    name = _get_friendly_name(comm, os.path.basename(comm))
+                    processes.append(ProcessInfo(
+                        pid=pid,
+                        name=name,
+                        cmdline=comm,
+                        cpu_pct=cpu_pct,
+                        mem_rss_kb=rss_kb,
+                    ))
+                except (ValueError, IndexError):
+                    continue
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+        processes.sort(key=lambda p: p.cpu_pct, reverse=True)
+        return processes[:self.top_n]
+
+    def _collect_win(self) -> list[ProcessInfo]:
+        """Windows: PowerShell でプロセス情報を取得。"""
+        processes: list[ProcessInfo] = []
+        try:
+            cmd = (
+                "Get-Process | Sort-Object CPU -Descending | "
+                "Select-Object -First 15 | "
+                "ForEach-Object { $_.Id.ToString() + '|' + "
+                "[math]::Round($_.CPU,1).ToString() + '|' + "
+                "([math]::Round($_.WorkingSet64/1KB,0)).ToString() + '|' + "
+                "$_.ProcessName }"
+            )
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", cmd],
+                capture_output=True, text=True, timeout=5,
+            )
+            if out.returncode == 0:
+                for line in out.stdout.strip().splitlines():
+                    parts = line.split("|", 3)
+                    if len(parts) >= 4:
+                        try:
+                            pid = int(parts[0])
+                            cpu_pct = float(parts[1]) if parts[1] else 0.0
+                            rss_kb = int(float(parts[2])) if parts[2] else 0
+                            comm = parts[3].strip()
+                            name = _get_friendly_name(comm, comm)
+                            processes.append(ProcessInfo(
+                                pid=pid,
+                                name=name,
+                                cmdline=comm,
+                                cpu_pct=cpu_pct,
+                                mem_rss_kb=rss_kb,
+                            ))
+                        except (ValueError, IndexError):
+                            continue
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
         processes.sort(key=lambda p: p.cpu_pct, reverse=True)
         return processes[:self.top_n]

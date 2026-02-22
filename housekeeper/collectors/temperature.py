@@ -1,20 +1,24 @@
-"""Temperature collector - /sys/class/hwmon から各種温度センサーを取得。
+"""Temperature & Fan collector - /sys/class/hwmon から各種温度・ファンセンサーを取得。
 
 対応:
   - CPU: k10temp (AMD), coretemp (Intel)
   - NVMe: nvme ドライバ
   - GPU: amdgpu, nouveau
   - その他: acpitz, thinkpad 等
+  - ファン: nct6775/it8688 等のスーパーI/Oチップ
 
-すべて /sys/class/hwmon/hwmon*/temp*_input から読み取る。
-外部コマンド不要、完全に sysfs 読み取りのみ。
+すべて /sys/class/hwmon/hwmon*/temp*_input, fan*_input から読み取る。
+macOS/Windows: 外部コマンド不要で空リストを返す (温度は GPU コレクター等で取得)。
 """
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+
+_IS_LINUX = sys.platform.startswith("linux")
 
 # hwmon ドライバ名からカテゴリへのマッピング
 _DRIVER_CATEGORY: dict[str, str] = {
@@ -45,6 +49,14 @@ _DRIVER_CATEGORY: dict[str, str] = {
 
 
 @dataclass
+class FanSensor:
+    """個別のファンセンサー。"""
+    label: str               # 表示ラベル ("fan1", "CPU Fan" 等)
+    rpm: int                 # 現在回転数 (RPM)
+    min_rpm: int = 0         # 最低回転数 (0 = 不明)
+
+
+@dataclass
 class TempSensor:
     """個別の温度センサー。"""
     label: str               # 表示ラベル ("Tctl", "Composite", "Sensor 1" 等)
@@ -60,6 +72,7 @@ class TempDevice:
     category: str             # カテゴリ (CPU, NVMe, GPU, etc.)
     device_label: str = ""    # デバイス特定ラベル (nvme0 等)
     sensors: list[TempSensor] = field(default_factory=list)
+    fans: list[FanSensor] = field(default_factory=list)
 
     @property
     def primary_temp_c(self) -> float:
@@ -77,14 +90,28 @@ class TempDevice:
         return self.sensors[0].crit_c if self.sensors else 0.0
 
     @property
+    def icon(self) -> str:
+        """カテゴリに応じたアイコン。"""
+        return {
+            "CPU": "⚙",
+            "NVMe": "💾",
+            "Disk": "💾",
+            "GPU": "🎮",
+            "ACPI": "🌡",
+            "Mainboard": "🔌",
+            "WiFi": "📶",
+            "Thinkpad": "💻",
+        }.get(self.category, "🌡")
+
+    @property
     def display_name(self) -> str:
         """表示用名前。"""
-        # CPU は特別: PCIe アドレスではなくドライバ名を使う
+        icon = self.icon
         if self.category == "CPU":
-            return f"CPU ({self.name})"
+            return f"{icon}CPU ({self.name})"
         if self.device_label and ":" not in self.device_label:
-            return f"{self.category}: {self.device_label}"
-        return f"{self.category}: {self.name}"
+            return f"{icon}{self.category}: {self.device_label}"
+        return f"{icon}{self.category}: {self.name}"
 
 
 def _read_sysfs(path: Path) -> str:
@@ -103,7 +130,7 @@ def _read_int(path: Path) -> int:
 
 
 class TemperatureCollector:
-    """温度センサーコレクター。"""
+    """温度・ファンセンサーコレクター。"""
 
     def __init__(self) -> None:
         self._hwmon_map: dict[str, str] = {}  # hwmonX → device_label
@@ -127,6 +154,9 @@ class TemperatureCollector:
         return ""
 
     def collect(self) -> list[TempDevice]:
+        if not _IS_LINUX:
+            return []
+
         hwmon_root = Path("/sys/class/hwmon")
         if not hwmon_root.exists():
             return []
@@ -173,12 +203,37 @@ class TemperatureCollector:
                     max_c=max_c,
                 ))
 
-            if sensors:
+            # fan*_input ファイルを探す
+            fans: list[FanSensor] = []
+            for i in range(1, 10):  # fan1 ~ fan9
+                fan_file = hwmon_dir / f"fan{i}_input"
+                if not fan_file.exists():
+                    continue
+
+                rpm = _read_int(fan_file)
+                # RPM 0 は停止中 (表示する)、ファイル自体がない場合はスキップ
+
+                # ラベル
+                label = _read_sysfs(hwmon_dir / f"fan{i}_label")
+                if not label:
+                    label = f"fan{i}"
+
+                # 最低回転数
+                min_rpm = _read_int(hwmon_dir / f"fan{i}_min")
+
+                fans.append(FanSensor(
+                    label=label,
+                    rpm=rpm,
+                    min_rpm=min_rpm,
+                ))
+
+            if sensors or fans:
                 devices.append(TempDevice(
                     name=driver_name,
                     category=category,
                     device_label=device_label,
                     sensors=sensors,
+                    fans=fans,
                 ))
 
         return devices

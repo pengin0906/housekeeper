@@ -1,20 +1,15 @@
-"""Network I/O collector - reads /proc/net/dev.
+"""Network I/O collector.
 
-/proc/net/dev の各行 (ヘッダ2行の後):
-  iface: rx_bytes rx_packets ... tx_bytes tx_packets ...
-
-差分から受信/送信のバイト/秒を計算する。
-lo (loopback) は除外。
-
-インターフェースの分類:
-  - WAN (インターネット向け): デフォルトルートを持つインターフェース
-  - LAN (ローカル): プライベートアドレス (10.x, 172.16-31.x, 192.168.x)
-  - Virtual: docker*, veth*, br-*, virbr* 等
+Linux: /proc/net/dev + /sys/class/net で WAN/LAN/VIRTUAL 分類。
+macOS: netstat -ib でインターフェース統計。
+Windows: PowerShell Get-NetAdapterStatistics で取得。
 """
 
 from __future__ import annotations
 
 import ipaddress
+import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -22,9 +17,9 @@ from pathlib import Path
 
 
 class NetType(Enum):
-    WAN = "WAN"       # デフォルトルートを持つ (インターネット向け)
-    LAN = "LAN"       # ローカルネットワーク
-    VIRTUAL = "VIR"   # Docker, bridge 等の仮想インターフェース
+    WAN = "WAN"
+    LAN = "LAN"
+    VIRTUAL = "VIR"
     UNKNOWN = "???"
 
 
@@ -43,9 +38,9 @@ class NetUsage:
     tx_bytes_sec: float = 0.0
 
     # Bonding / LACP メタデータ
-    bond_mode: str = ""               # "802.3ad", "balance-rr" 等
+    bond_mode: str = ""
     bond_members: list[str] | None = None
-    bond_member_of: str = ""          # メンバーの場合: 所属するボンドIF名
+    bond_member_of: str = ""
 
     @property
     def total_bytes_sec(self) -> float:
@@ -60,16 +55,18 @@ class NetUsage:
         return f"[{self.net_type.value}]{self.name}"
 
 
-# 仮想インターフェースの判別パターン
+_IS_DARWIN = sys.platform == "darwin"
+_IS_WIN = sys.platform == "win32"
+
 _VIRTUAL_PREFIXES = ("docker", "veth", "br-", "virbr", "lxc", "flannel",
                      "cni", "calico", "tun", "tap")
 
 
 def _classify_interfaces() -> dict[str, NetType]:
-    """各ネットワークインターフェースを WAN/LAN/VIRTUAL に分類する。"""
-    classification: dict[str, NetType] = {}
+    if _IS_DARWIN or _IS_WIN:
+        return {}
 
-    # デフォルトルートを持つインターフェースを特定
+    classification: dict[str, NetType] = {}
     default_ifaces: set[str] = set()
     try:
         with open("/proc/net/route") as f:
@@ -80,26 +77,18 @@ def _classify_interfaces() -> dict[str, NetType]:
     except OSError:
         pass
 
-    # 各インターフェースの IP アドレスを取得して分類
     try:
         net_path = Path("/sys/class/net")
         for iface_dir in sorted(net_path.iterdir()):
             iface = iface_dir.name
             if iface == "lo":
                 continue
-
-            # 仮想インターフェースの判別
             if any(iface.startswith(p) for p in _VIRTUAL_PREFIXES):
                 classification[iface] = NetType.VIRTUAL
                 continue
-
-            # /sys/class/net/<iface>/type でタイプ確認
-            # type 772 = loopback, 他にも仮想があるがここでは省略
-
             if iface in default_ifaces:
                 classification[iface] = NetType.WAN
             else:
-                # IP アドレスからプライベートかどうか判定
                 ip_addr = _get_iface_ip(iface)
                 if ip_addr:
                     try:
@@ -112,7 +101,6 @@ def _classify_interfaces() -> dict[str, NetType]:
                         classification[iface] = NetType.LAN
                 else:
                     classification[iface] = NetType.LAN
-
     except OSError:
         pass
 
@@ -120,25 +108,19 @@ def _classify_interfaces() -> dict[str, NetType]:
 
 
 def _get_iface_ip(iface: str) -> str | None:
-    """インターフェースの IPv4 アドレスを取得 (/proc/net/fib_trie は複雑なので
-    /sys/class/net/<iface>/address ではなく ip コマンド不要の方法で)。"""
     try:
-        # /proc/net/if_inet6 で IPv6 を見ることもできるが、
-        # ここでは /proc/net/fib_trie からの簡易取得を試みる
         with open("/proc/net/fib_trie") as f:
-            content = f.read()
-        # 簡易: 正確にはパースが必要だが、ここではフォールバック
+            f.read()
         return None
     except OSError:
         return None
 
 
 def _discover_bonds() -> dict[str, tuple[str, list[str]]]:
-    """sysfs から bonding インターフェース情報を取得。
-
-    Returns: {bond_name: (mode, [member_names])}
-    """
+    """sysfs から bonding 情報取得 (Linux only)。"""
     result: dict[str, tuple[str, list[str]]] = {}
+    if _IS_DARWIN or _IS_WIN:
+        return result
     net_path = Path("/sys/class/net")
     if not net_path.exists():
         return result
@@ -162,18 +144,25 @@ def _discover_bonds() -> dict[str, tuple[str, list[str]]]:
 
 
 class NetworkCollector:
-    """Network I/O コレクター (WAN/LAN/VIRTUAL 分類付き)。"""
+    """Network I/O コレクター。"""
 
     def __init__(self) -> None:
         self._prev: dict[str, NetStats] = {}
         self._prev_time: float = 0.0
         self._classification: dict[str, NetType] = {}
-        self._classify_interval: float = 0.0  # 最後に分類した時間
+        self._classify_interval: float = 0.0
         self._bond_info: dict[str, tuple[str, list[str]]] = {}
         self._member_to_bond: dict[str, str] = {}
         self._update_bonds()
 
     def _read_netdev(self) -> dict[str, NetStats]:
+        if _IS_DARWIN:
+            return self._read_netdev_darwin()
+        if _IS_WIN:
+            return self._read_netdev_win()
+        return self._read_netdev_linux()
+
+    def _read_netdev_linux(self) -> dict[str, NetStats]:
         result: dict[str, NetStats] = {}
         with open("/proc/net/dev") as f:
             for line in f:
@@ -191,8 +180,60 @@ class NetworkCollector:
                 )
         return result
 
+    def _read_netdev_darwin(self) -> dict[str, NetStats]:
+        """macOS: netstat -ib でインターフェース統計。"""
+        result: dict[str, NetStats] = {}
+        try:
+            out = subprocess.run(
+                ["netstat", "-ib"],
+                capture_output=True, text=True, timeout=3,
+            )
+            if out.returncode != 0:
+                return result
+            for line in out.stdout.splitlines()[1:]:
+                parts = line.split()
+                if len(parts) < 10:
+                    continue
+                iface = parts[0]
+                if iface.startswith("lo"):
+                    continue
+                try:
+                    ibytes = int(parts[6])
+                    obytes = int(parts[9])
+                    if iface in result:
+                        if ibytes > result[iface].rx_bytes:
+                            result[iface] = NetStats(name=iface, rx_bytes=ibytes, tx_bytes=obytes)
+                    else:
+                        result[iface] = NetStats(name=iface, rx_bytes=ibytes, tx_bytes=obytes)
+                except (ValueError, IndexError):
+                    continue
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        return result
+
+    def _read_netdev_win(self) -> dict[str, NetStats]:
+        """Windows: PowerShell で取得。"""
+        result: dict[str, NetStats] = {}
+        try:
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "Get-NetAdapterStatistics | "
+                 "ForEach-Object { $_.Name + '|' + $_.ReceivedBytes + '|' + $_.SentBytes }"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if out.returncode == 0:
+                for line in out.stdout.strip().splitlines():
+                    parts = line.split("|")
+                    if len(parts) >= 3:
+                        name = parts[0].strip()
+                        rx = int(parts[1])
+                        tx = int(parts[2])
+                        result[name] = NetStats(name=name, rx_bytes=rx, tx_bytes=tx)
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            pass
+        return result
+
     def _update_bonds(self) -> None:
-        """ボンディング情報を更新。"""
         self._bond_info = _discover_bonds()
         self._member_to_bond = {}
         for bond_name, (_, members) in self._bond_info.items():
@@ -200,7 +241,6 @@ class NetworkCollector:
                 self._member_to_bond[m] = bond_name
 
     def _update_classification(self) -> None:
-        """10秒ごとにインターフェース分類とボンディング情報を更新。"""
         now = time.monotonic()
         if now - self._classify_interval > 10.0:
             self._classification = _classify_interfaces()
@@ -215,7 +255,6 @@ class NetworkCollector:
         dt = now - self._prev_time if self._prev_time else 0.0
         usages: list[NetUsage] = []
 
-        # WAN → LAN → VIRTUAL の順にソート
         type_order = {NetType.WAN: 0, NetType.LAN: 1, NetType.VIRTUAL: 2, NetType.UNKNOWN: 3}
 
         for name in sorted(curr.keys(),
@@ -233,7 +272,6 @@ class NetworkCollector:
                     tx_bytes_sec=(c.tx_bytes - prev.tx_bytes) / dt,
                 )
 
-            # ボンディングメタデータ付与
             if name in self._bond_info:
                 mode, members = self._bond_info[name]
                 nu.bond_mode = mode
@@ -243,7 +281,6 @@ class NetworkCollector:
 
             usages.append(nu)
 
-        # ボンドIF の直後にメンバーを配置
         if self._bond_info:
             def _sort_key(n: NetUsage) -> tuple[int, str, int, str]:
                 t = type_order.get(n.net_type, 3)

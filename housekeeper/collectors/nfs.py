@@ -1,14 +1,22 @@
-"""NFS/SAN/NAS mount collector - /proc/mounts と mountstats から取得。
+"""NFS/SAN/NAS mount collector.
 
-NFS マウントの I/O 状況を /proc/self/mountstats から取得。
-CIFS (Samba), iSCSI 等のネットワークストレージも /proc/mounts から検出。
+Linux: /proc/mounts + /proc/self/mountstats から取得。
+macOS: mount コマンドでネットワークマウントを検出。
+Windows: net use コマンドでネットワークドライブを検出。
 """
 
 from __future__ import annotations
 
+import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+
+
+_IS_LINUX = sys.platform.startswith("linux")
+_IS_DARWIN = sys.platform == "darwin"
+_IS_WIN = sys.platform == "win32"
 
 
 @dataclass
@@ -48,6 +56,8 @@ class NfsMountInfo:
             return "Lustre"
         if "9p" in self.fs_type:
             return "9P"
+        if "smb" in self.fs_type:
+            return "SMB"
         return self.fs_type.upper()[:6]
 
 
@@ -77,6 +87,16 @@ class NfsMountCollector:
         self._prev_time: float = 0.0
 
     def _read_net_mounts(self) -> list[NfsMountInfo]:
+        """ネットワークマウントを取得。"""
+        if _IS_LINUX:
+            return self._read_net_mounts_linux()
+        if _IS_DARWIN:
+            return self._read_net_mounts_darwin()
+        if _IS_WIN:
+            return self._read_net_mounts_win()
+        return []
+
+    def _read_net_mounts_linux(self) -> list[NfsMountInfo]:
         """/proc/mounts からネットワークマウントを取得。"""
         mounts: list[NfsMountInfo] = []
         try:
@@ -96,8 +116,68 @@ class NfsMountCollector:
             pass
         return mounts
 
+    def _read_net_mounts_darwin(self) -> list[NfsMountInfo]:
+        """macOS: mount コマンドからネットワークマウントを取得。"""
+        mounts: list[NfsMountInfo] = []
+        try:
+            out = subprocess.run(
+                ["mount"],
+                capture_output=True, text=True, timeout=3,
+            )
+            if out.returncode != 0:
+                return mounts
+            for line in out.stdout.splitlines():
+                # "server:/export on /mnt/nfs (nfs, ...)"
+                parts = line.split(" on ", 1)
+                if len(parts) < 2:
+                    continue
+                device = parts[0].strip()
+                rest = parts[1]
+                # "/mnt/nfs (nfs, ...)"
+                paren_idx = rest.find("(")
+                if paren_idx < 0:
+                    continue
+                mount_point = rest[:paren_idx].strip()
+                opts = rest[paren_idx + 1:].rstrip(")").strip()
+                fs_type = opts.split(",")[0].strip()
+                if fs_type in _NET_FS_TYPES or "nfs" in fs_type or "smb" in fs_type or "cifs" in fs_type:
+                    mounts.append(NfsMountInfo(
+                        device=device,
+                        mount_point=mount_point,
+                        fs_type=fs_type,
+                    ))
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        return mounts
+
+    def _read_net_mounts_win(self) -> list[NfsMountInfo]:
+        """Windows: net use コマンドからネットワークドライブを取得。"""
+        mounts: list[NfsMountInfo] = []
+        try:
+            out = subprocess.run(
+                ["net", "use"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if out.returncode != 0:
+                return mounts
+            for line in out.stdout.splitlines():
+                parts = line.split()
+                if len(parts) >= 3 and parts[0] in ("OK", "Disconnected", "Unavailable"):
+                    drive = parts[1]  # "Z:"
+                    remote = parts[2]  # "\\server\share"
+                    mounts.append(NfsMountInfo(
+                        device=remote,
+                        mount_point=drive,
+                        fs_type="smb",
+                    ))
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        return mounts
+
     def _read_mountstats(self, mounts: list[NfsMountInfo]) -> None:
         """NFS マウントの /proc/self/mountstats から I/O 統計を読み取る。"""
+        if not _IS_LINUX:
+            return
         try:
             content = Path("/proc/self/mountstats").read_text()
         except (OSError, PermissionError):

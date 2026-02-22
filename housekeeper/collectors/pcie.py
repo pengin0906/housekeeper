@@ -1,13 +1,8 @@
-"""PCIe bandwidth collector - /sys/bus/pci/devices から PCIe 情報を取得。
+"""PCIe bandwidth collector.
 
-各 PCIe デバイスの:
-  - リンク速度 (current_link_speed)
-  - リンク幅 (current_link_width)
-  - 最大リンク速度 / 幅
-  - デバイス名
-  - 実 I/O スループット (NVMe→/proc/diskstats, NIC→/proc/net/dev と相関)
-
-/sys/bus/pci/devices/XXXX:XX:XX.X/ 以下のファイルを読み取る。
+Linux: /sys/bus/pci/devices から PCIe 情報を取得。
+macOS: system_profiler SPPCIDataType でPCIeデバイスを取得。
+Windows: PCIe情報は取得困難なため空リストを返す。
 """
 
 from __future__ import annotations
@@ -15,10 +10,14 @@ from __future__ import annotations
 import re
 import shutil
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
+
+_IS_LINUX = sys.platform.startswith("linux")
+_IS_DARWIN = sys.platform == "darwin"
 
 # PCIe 世代ごとの per-lane 帯域 (GB/s, エンコーディングオーバーヘッド込み)
 _PCIE_SPEED_GBS: dict[str, float] = {
@@ -189,9 +188,10 @@ class PcieCollector:
         self._prev_time: float = 0.0
         self._nvidia_pcie: bool = bool(shutil.which("nvidia-smi"))
         self._gpu_bdf_map: dict[str, int] = {}  # sysfs BDF → GPU index
-        self._discover_subsystems()
-        if self._nvidia_pcie:
-            self._discover_nvidia_gpus()
+        if _IS_LINUX:
+            self._discover_subsystems()
+            if self._nvidia_pcie:
+                self._discover_nvidia_gpus()
 
     def _discover_subsystems(self) -> None:
         """PCIe BDF アドレスとサブシステムデバイス (NVMe, NIC) の対応付け。"""
@@ -336,6 +336,10 @@ class PcieCollector:
         return result
 
     def collect(self) -> list[PcieDeviceInfo]:
+        if not _IS_LINUX:
+            # macOS: system_profiler は遅いので基本的には空を返す
+            return []
+
         pci_path = Path("/sys/bus/pci/devices")
         if not pci_path.exists():
             return []

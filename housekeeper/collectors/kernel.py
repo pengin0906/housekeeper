@@ -1,17 +1,15 @@
-"""Kernel info collector - /proc から各種カーネル統計を取得。
+"""Kernel info collector.
 
-取得する情報:
-  - Load Average (1/5/15分) - /proc/loadavg
-  - Uptime - /proc/uptime
-  - Context Switches/sec - /proc/stat の ctxt
-  - Interrupts/sec - /proc/stat の intr (合計)
-  - Running/Total processes - /proc/loadavg
-  - Kernel version - /proc/version
+Linux: /proc/loadavg, /proc/uptime, /proc/stat, /proc/version
+macOS: os.getloadavg(), sysctl kern.boottime, platform.release()
 """
 
 from __future__ import annotations
 
 import os
+import platform
+import subprocess
+import sys
 import time
 from dataclasses import dataclass
 
@@ -44,8 +42,10 @@ class KernelInfo:
 
     @property
     def load_per_cpu(self) -> float:
-        """1分間ロードアベレージをCPU数で割った値 (1.0 = 100%)。"""
         return self.load_1 / self.num_cpus if self.num_cpus else self.load_1
+
+
+_IS_DARWIN = sys.platform == "darwin"
 
 
 class KernelCollector:
@@ -60,53 +60,62 @@ class KernelCollector:
 
     @staticmethod
     def _read_kernel_version() -> str:
+        if _IS_DARWIN:
+            return platform.release()
         try:
             with open("/proc/version") as f:
                 parts = f.read().split()
-                # "Linux version 6.8.0-100-generic ..." -> "6.8.0-100-generic"
                 return parts[2] if len(parts) > 2 else ""
         except OSError:
-            return ""
+            return platform.release()
 
     def collect(self) -> KernelInfo:
         now = time.monotonic()
         dt = now - self._prev_time if self._prev_time else 0.0
 
-        # /proc/loadavg: "0.42 0.35 0.28 2/1234 56789"
+        # Load average
         load_1 = load_5 = load_15 = 0.0
         running = total = 0
         try:
-            with open("/proc/loadavg") as f:
-                parts = f.read().split()
-                load_1 = float(parts[0])
-                load_5 = float(parts[1])
-                load_15 = float(parts[2])
-                procs = parts[3].split("/")
-                running = int(procs[0])
-                total = int(procs[1])
-        except (OSError, ValueError, IndexError):
+            load_1, load_5, load_15 = os.getloadavg()
+        except OSError:
             pass
 
-        # /proc/uptime: "123456.78 234567.89"
+        # Running/total procs (Linux only from /proc/loadavg)
+        if not _IS_DARWIN:
+            try:
+                with open("/proc/loadavg") as f:
+                    parts = f.read().split()
+                    procs = parts[3].split("/")
+                    running = int(procs[0])
+                    total = int(procs[1])
+            except (OSError, ValueError, IndexError):
+                pass
+
+        # Uptime
         uptime = 0.0
-        try:
-            with open("/proc/uptime") as f:
-                uptime = float(f.read().split()[0])
-        except (OSError, ValueError, IndexError):
-            pass
+        if _IS_DARWIN:
+            uptime = self._read_uptime_darwin()
+        else:
+            try:
+                with open("/proc/uptime") as f:
+                    uptime = float(f.read().split()[0])
+            except (OSError, ValueError, IndexError):
+                pass
 
-        # /proc/stat: context switches と interrupts
+        # Context switches / interrupts (Linux only)
         ctxt = 0
         intr = 0
-        try:
-            with open("/proc/stat") as f:
-                for line in f:
-                    if line.startswith("ctxt "):
-                        ctxt = int(line.split()[1])
-                    elif line.startswith("intr "):
-                        intr = int(line.split()[1])
-        except (OSError, ValueError, IndexError):
-            pass
+        if not _IS_DARWIN:
+            try:
+                with open("/proc/stat") as f:
+                    for line in f:
+                        if line.startswith("ctxt "):
+                            ctxt = int(line.split()[1])
+                        elif line.startswith("intr "):
+                            intr = int(line.split()[1])
+            except (OSError, ValueError, IndexError):
+                pass
 
         ctx_sec = 0.0
         intr_sec = 0.0
@@ -130,3 +139,21 @@ class KernelCollector:
             kernel_version=self._kernel_version,
             num_cpus=self._num_cpus,
         )
+
+    @staticmethod
+    def _read_uptime_darwin() -> float:
+        """macOS: sysctl kern.boottime からアップタイムを計算。"""
+        try:
+            out = subprocess.run(
+                ["sysctl", "-n", "kern.boottime"],
+                capture_output=True, text=True, timeout=2,
+            )
+            if out.returncode == 0:
+                # "{ sec = 1708123456, usec = 123456 } ..."
+                text = out.stdout.strip()
+                sec_part = text.split("sec =")[1].split(",")[0].strip()
+                boot_time = int(sec_part)
+                return time.time() - boot_time
+        except (OSError, subprocess.TimeoutExpired, ValueError, IndexError):
+            pass
+        return 0.0

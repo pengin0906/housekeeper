@@ -1,15 +1,15 @@
-"""CPU usage collector - reads /proc/stat.
+"""CPU usage collector.
 
-/proc/stat の各行は以下の形式:
-  cpu  user nice system idle iowait irq softirq steal guest guest_nice
-
-各値は起動時からの累積 jiffies (1/100秒) なので、
-2回の読み取り差分から使用率を計算する。
+Linux: /proc/stat から累積 jiffies を読み取り、差分で使用率を計算。
+macOS: sysctl kern.cp_time (合計) + per-core は host_processor_info 相当を
+       top コマンドで取得。
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import subprocess
+import sys
+from dataclasses import dataclass
 
 
 @dataclass
@@ -52,26 +52,83 @@ class CpuUsage:
         return 100.0 - self.idle_pct
 
 
-class CpuCollector:
-    """CPU 使用率コレクター。
+_IS_DARWIN = sys.platform == "darwin"
 
-    /proc/stat を定期的に読み取り、前回との差分から使用率を計算する。
-    per-core + 全体合計を返す。
-    """
+
+class CpuCollector:
+    """CPU 使用率コレクター。"""
 
     def __init__(self) -> None:
         self._prev: dict[str, CpuTimes] = {}
 
     def _read_stat(self) -> dict[str, CpuTimes]:
+        if _IS_DARWIN:
+            return self._read_stat_darwin()
+        return self._read_stat_linux()
+
+    def _read_stat_linux(self) -> dict[str, CpuTimes]:
         result: dict[str, CpuTimes] = {}
         with open("/proc/stat") as f:
             for line in f:
                 if not line.startswith("cpu"):
                     break
                 parts = line.split()
-                name = parts[0]  # "cpu" or "cpu0", "cpu1", ...
+                name = parts[0]
                 vals = [int(x) for x in parts[1:9]]
                 result[name] = CpuTimes(*vals)
+        return result
+
+    def _read_stat_darwin(self) -> dict[str, CpuTimes]:
+        """macOS: sysctl で CPU ticks を取得。"""
+        result: dict[str, CpuTimes] = {}
+        try:
+            # kern.cp_time: user nice sys idle (マイクロ秒)
+            out = subprocess.run(
+                ["sysctl", "-n", "kern.cp_time"],
+                capture_output=True, text=True, timeout=2,
+            )
+            if out.returncode == 0:
+                parts = out.stdout.strip().split()
+                if len(parts) >= 4:
+                    result["cpu"] = CpuTimes(
+                        user=int(parts[0]),
+                        nice=int(parts[1]),
+                        system=int(parts[2]),
+                        idle=int(parts[3]),
+                    )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+        if not result:
+            # フォールバック: top -l 1 で概算
+            try:
+                out = subprocess.run(
+                    ["top", "-l", "1", "-n", "0", "-s", "0"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                for line in out.stdout.splitlines():
+                    if "CPU usage:" in line:
+                        # "CPU usage: 5.26% user, 10.52% sys, 84.21% idle"
+                        # ticks に変換 (概算)
+                        user = sys_pct = idle = 0.0
+                        for part in line.split(","):
+                            part = part.strip()
+                            if "user" in part:
+                                user = float(part.split("%")[0].split()[-1])
+                            elif "sys" in part:
+                                sys_pct = float(part.split("%")[0].split()[-1])
+                            elif "idle" in part:
+                                idle = float(part.split("%")[0].split()[-1])
+                        scale = 10000
+                        result["cpu"] = CpuTimes(
+                            user=int(user * scale),
+                            system=int(sys_pct * scale),
+                            idle=int(idle * scale),
+                        )
+                        break
+            except (OSError, subprocess.TimeoutExpired, ValueError):
+                pass
+
         return result
 
     def collect(self) -> list[CpuUsage]:

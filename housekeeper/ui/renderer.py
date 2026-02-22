@@ -425,7 +425,7 @@ class Renderer:
         draw_section_header(win, y, x, width, "Temperature", PAIR_HEADER)
         y += 1
 
-        # hwmon センサー
+        # hwmon センサー (温度)
         for dev in devices:
             if y >= max_y - 1:
                 break
@@ -445,6 +445,24 @@ class Renderer:
                      value_text=val, value_width=val_w + 4,
                      label_color=PAIR_LABEL)
             y += 1
+
+        # hwmon ファンセンサー
+        for dev in devices:
+            for fan in dev.fans:
+                if y >= max_y - 1:
+                    break
+                max_rpm = 5000.0
+                frac = min(fan.rpm / max_rpm, 1.0) if max_rpm > 0 else 0.0
+                color = PAIR_GPU_FAN
+                fan_label = f"{fan.label}"[:label_w]
+                val = f"{fan.rpm} RPM"
+
+                draw_bar(win, y, x, width,
+                         [BarSegment(frac, color)],
+                         label=fan_label, label_width=label_w,
+                         value_text=val, value_width=val_w + 4,
+                         label_color=PAIR_LABEL)
+                y += 1
 
         # NVIDIA GPU 温度
         if nvidia_gpus:

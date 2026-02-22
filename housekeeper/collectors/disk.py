@@ -1,18 +1,15 @@
-"""Disk I/O collector - reads /proc/diskstats.
+"""Disk I/O collector.
 
-/proc/diskstats の各行:
-  major minor name rd_ios rd_merges rd_sectors rd_ticks
-                   wr_ios wr_merges wr_sectors wr_ticks
-                   ios_in_prog io_ticks weighted_io_ticks
-                   [discard fields...]
-
-セクターサイズは 512 バイトとして計算する。
-差分から read/write のバイト/秒とIOPS を取得。
+Linux: /proc/diskstats + /sys/block で RAID 検出。
+macOS: iostat -d でディスク I/O 取得。
+Windows: PowerShell Get-Counter でディスク統計取得 (ベストエフォート)。
 """
 
 from __future__ import annotations
 
 import re
+import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -36,10 +33,10 @@ class DiskUsage:
     write_iops: float = 0.0
 
     # RAID メタデータ
-    raid_level: str = ""              # md デバイスの場合: "raid0", "raid1" 等
+    raid_level: str = ""
     raid_members: list[str] = field(default_factory=list)
-    raid_state: str = ""              # "clean", "active", "degraded" 等
-    raid_member_of: str = ""          # メンバーの場合: 所属する md デバイス名
+    raid_state: str = ""
+    raid_member_of: str = ""
 
     @property
     def total_bytes_sec(self) -> float:
@@ -47,7 +44,6 @@ class DiskUsage:
 
     @property
     def display_name(self) -> str:
-        """表示用ラベル。RAID 情報付き。"""
         if self.raid_level:
             level = self.raid_level.upper().replace("RAID", "R")
             return f"{self.name} {level}×{len(self.raid_members)}"
@@ -57,13 +53,15 @@ class DiskUsage:
 # フィルタ: sd*, nvme*, vd*, md* のみ (パーティションは除外)
 _DISK_RE = re.compile(r"^(sd[a-z]+|nvme\d+n\d+|vd[a-z]+|md\d+)$")
 
+_IS_DARWIN = sys.platform == "darwin"
+_IS_WIN = sys.platform == "win32"
+
 
 def _discover_md_arrays() -> dict[str, tuple[str, list[str], str]]:
-    """sysfs から md RAID 情報を取得。
-
-    Returns: {md_name: (level, [member_names], state)}
-    """
+    """sysfs から md RAID 情報を取得 (Linux only)。"""
     result: dict[str, tuple[str, list[str], str]] = {}
+    if _IS_DARWIN or _IS_WIN:
+        return result
     sys_block = Path("/sys/block")
     if not sys_block.exists():
         return result
@@ -98,13 +96,19 @@ class DiskCollector:
         self._prev: dict[str, DiskStats] = {}
         self._prev_time: float = 0.0
         self._md_info = _discover_md_arrays()
-        # メンバー → md 逆引き
         self._member_to_md: dict[str, str] = {}
         for md_name, (_, members, _) in self._md_info.items():
             for m in members:
                 self._member_to_md[m] = md_name
 
     def _read_diskstats(self) -> dict[str, DiskStats]:
+        if _IS_DARWIN:
+            return self._read_diskstats_darwin()
+        if _IS_WIN:
+            return self._read_diskstats_win()
+        return self._read_diskstats_linux()
+
+    def _read_diskstats_linux(self) -> dict[str, DiskStats]:
         result: dict[str, DiskStats] = {}
         with open("/proc/diskstats") as f:
             for line in f:
@@ -119,6 +123,72 @@ class DiskCollector:
                     wr_ios=int(parts[7]),
                     wr_sectors=int(parts[9]),
                 )
+        return result
+
+    def _read_diskstats_darwin(self) -> dict[str, DiskStats]:
+        """macOS: iostat -d でディスク統計を取得。"""
+        result: dict[str, DiskStats] = {}
+        try:
+            out = subprocess.run(
+                ["iostat", "-d", "-K", "-c", "1"],
+                capture_output=True, text=True, timeout=3,
+            )
+            if out.returncode != 0:
+                return result
+            lines = out.stdout.strip().splitlines()
+            if len(lines) < 3:
+                return result
+            headers = lines[0].split()
+            data_line = lines[2].split() if len(lines) > 2 else []
+            col = 0
+            for dev_name in headers:
+                if col + 2 >= len(data_line):
+                    break
+                try:
+                    kbs = float(data_line[col + 2])
+                    sectors = int(kbs * 2)
+                    result[dev_name] = DiskStats(name=dev_name, rd_sectors=sectors)
+                except (ValueError, IndexError):
+                    pass
+                col += 3
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        return result
+
+    def _read_diskstats_win(self) -> dict[str, DiskStats]:
+        """Windows: PowerShell Get-Counter でディスク統計を取得。"""
+        result: dict[str, DiskStats] = {}
+        try:
+            cmd = (
+                "Get-Counter "
+                "'\\PhysicalDisk(*)\\Disk Read Bytes/sec',"
+                "'\\PhysicalDisk(*)\\Disk Write Bytes/sec' "
+                "-SampleInterval 0 | "
+                "Select-Object -ExpandProperty CounterSamples | "
+                "ForEach-Object { $_.InstanceName + '|' + $_.Path + '|' + $_.CookedValue }"
+            )
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", cmd],
+                capture_output=True, text=True, timeout=5,
+            )
+            if out.returncode == 0:
+                for line in out.stdout.strip().splitlines():
+                    parts = line.split("|")
+                    if len(parts) >= 3:
+                        name = parts[0].strip()
+                        if name == "_total":
+                            continue
+                        path = parts[1].lower()
+                        val = float(parts[2])
+                        sectors = int(val / 512)
+                        if name not in result:
+                            result[name] = DiskStats(name=name)
+                        if "read" in path:
+                            result[name].rd_sectors = sectors
+                        elif "write" in path:
+                            result[name].wr_sectors = sectors
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            pass
         return result
 
     def collect(self) -> list[DiskUsage]:
@@ -155,7 +225,6 @@ class DiskCollector:
         self._prev = curr
         self._prev_time = now
 
-        # ソート: md デバイスを先頭に、その直後にメンバーを配置
         def _sort_key(d: DiskUsage) -> tuple[int, str, str]:
             if d.raid_level:
                 return (0, d.name, "")

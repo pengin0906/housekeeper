@@ -84,6 +84,71 @@ def _fmt_rate(v: float) -> str:
     return f"{v:.0f}"
 
 
+# セクションアイコン
+ICONS = {
+    "kernel":   "🐧",
+    "cpu":      "⚙",
+    "memory":   "🧠",
+    "temp":     "🌡",
+    "disk":     "💾",
+    "network":  "🌐",
+    "nfs":      "📁",
+    "pcie":     "🔌",
+    "nvidia":   "🎮",
+    "amd":      "🎮",
+    "gaudi":    "🧮",
+    "gpu_proc": "📊",
+    "proc":     "📋",
+}
+
+
+def _create_app_icon(root: tk.Tk) -> None:
+    """32x32 アプリアイコンをプログラム的に生成して設定。"""
+    size = 32
+    img = tk.PhotoImage(width=size, height=size)
+
+    # カラー定義
+    bg = "#0a0a14"
+    orange = "#ff6600"
+    dark_orange = "#cc5500"
+    bar_green = "#00cc66"
+    bar_yellow = "#cccc00"
+    bar_red = "#cc3333"
+    bar_cyan = "#00cccc"
+    frame_color = "#333344"
+
+    # 背景
+    img.put(bg, to=(0, 0, size, size))
+
+    # モニター外枠 (オレンジ) 4,2 ~ 27,24
+    img.put(orange, to=(4, 2, 28, 4))     # 上辺
+    img.put(orange, to=(4, 22, 28, 24))    # 下辺
+    img.put(orange, to=(4, 2, 6, 24))      # 左辺
+    img.put(orange, to=(26, 2, 28, 24))    # 右辺
+
+    # モニター内側 (暗い)
+    img.put("#0d0d1a", to=(6, 4, 26, 22))
+
+    # バーグラフ (4本、下から上に伸びる)
+    bars = [
+        (8, 18, bar_green),    # bar1: 高さ 18→8 (10px)
+        (13, 12, bar_yellow),  # bar2: 高さ 12→12 (10px → 高さ調整)
+        (18, 15, bar_red),     # bar3
+        (23, 10, bar_cyan),    # bar4
+    ]
+    for bx, top, color in bars:
+        img.put(color, to=(bx, top, bx + 3, 21))
+
+    # モニター台座
+    img.put(dark_orange, to=(12, 25, 20, 27))
+    img.put(frame_color, to=(10, 27, 22, 29))
+
+    try:
+        root.iconphoto(True, img)
+    except tk.TclError:
+        pass  # 一部環境ではアイコン設定が失敗する
+
+
 class HousekeeperGui:
     """EVA風 GUI システムモニター。"""
 
@@ -114,11 +179,14 @@ class HousekeeperGui:
         # クリック領域: セクションヘッダー + トグル行
         self._header_zones: list[tuple[int, int, str]] = []
         self._toggle_zones: list[tuple[int, int, str]] = []
+        self._help_btn_zone: tuple[int, int, int, int] = (0, 0, 0, 0)  # x1,y1,x2,y2
+        self._show_help: bool = False
 
         # ウィンドウ設定
         self.root = tk.Tk()
         self.root.title("housekeeper - System Monitor")
         self.root.configure(bg=COLORS["bg"])
+        _create_app_icon(self.root)
         self.root.geometry("850x900")
         self.root.minsize(600, 400)
 
@@ -144,6 +212,8 @@ class HousekeeperGui:
         self.root.bind("<Escape>", lambda e: self.root.quit())
         self.root.bind("<plus>", lambda e: self._change_interval(-500))
         self.root.bind("<minus>", lambda e: self._change_interval(500))
+        self.root.bind("<h>", lambda e: self._toggle_help())
+        self.root.bind("<H>", lambda e: self._toggle_help())
 
         self._init_collectors()
 
@@ -181,19 +251,12 @@ class HousekeeperGui:
             self.amd_col = _lazy_import("housekeeper.collectors.amd_gpu", "AmdGpuCollector")()
         if accel["gaudi"] and not self.args.no_gpu:
             self.gaudi_col = _lazy_import("housekeeper.collectors.gaudi", "GaudiCollector")()
-        if Path("/sys/bus/pci/devices").exists():
+        import sys as _sys
+        if _sys.platform.startswith("linux") and Path("/sys/bus/pci/devices").exists():
             self.pcie_col = _lazy_import("housekeeper.collectors.pcie", "PcieCollector")()
 
-        net_fs = {"nfs", "nfs4", "nfs3", "cifs", "smbfs", "glusterfs", "ceph", "lustre"}
-        try:
-            with open("/proc/mounts") as f:
-                for line in f:
-                    parts = line.split()
-                    if len(parts) >= 3 and parts[2] in net_fs:
-                        self.nfs_col = _lazy_import("housekeeper.collectors.nfs", "NfsMountCollector")()
-                        break
-        except OSError:
-            pass
+        # NFS/ネットワークマウント検出
+        self._detect_nfs_mounts()
 
         # ベースライン
         self.cpu_col.collect()
@@ -206,11 +269,60 @@ class HousekeeperGui:
         if self.pcie_col:
             self.pcie_col.collect()
 
+    def _detect_nfs_mounts(self) -> None:
+        """クロスプラットフォームでネットワークマウントを検出。"""
+        import sys as _sys
+        net_fs = {"nfs", "nfs4", "nfs3", "cifs", "smbfs", "glusterfs", "ceph", "lustre"}
+        if _sys.platform.startswith("linux"):
+            try:
+                with open("/proc/mounts") as f:
+                    for line in f:
+                        parts = line.split()
+                        if len(parts) >= 3 and parts[2] in net_fs:
+                            self.nfs_col = _lazy_import("housekeeper.collectors.nfs", "NfsMountCollector")()
+                            return
+            except OSError:
+                pass
+        elif _sys.platform == "darwin":
+            import subprocess
+            try:
+                out = subprocess.run(["mount"], capture_output=True, text=True, timeout=3)
+                if out.returncode == 0:
+                    for line in out.stdout.splitlines():
+                        lower = line.lower()
+                        if "nfs" in lower or "smbfs" in lower or "cifs" in lower:
+                            self.nfs_col = _lazy_import("housekeeper.collectors.nfs", "NfsMountCollector")()
+                            return
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        elif _sys.platform == "win32":
+            import subprocess
+            try:
+                out = subprocess.run(["net", "use"], capture_output=True, text=True, timeout=5)
+                if out.returncode == 0 and ("OK" in out.stdout or "Disconnected" in out.stdout):
+                    self.nfs_col = _lazy_import("housekeeper.collectors.nfs", "NfsMountCollector")()
+                    return
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+
     # ─── イベント ───────────────────────────────────────────
 
     def _on_click(self, event: Any) -> None:
         """Canvas クリック: ヘッダー行 or トグル行で展開/折りたたみ。"""
+        cx = event.x
         cy = self.canvas.canvasy(event.y)
+
+        # ヘルプ表示中ならクリックで閉じる
+        if self._show_help:
+            self._show_help = False
+            return
+
+        # ? ボタン
+        bx1, by1, bx2, by2 = self._help_btn_zone
+        if bx1 <= cx <= bx2 and by1 <= cy <= by2:
+            self._toggle_help()
+            return
+
         # トグル行を先にチェック (ヘッダー内にある場合があるため)
         for y1, y2, key in self._toggle_zones:
             if y1 <= cy <= y2:
@@ -220,6 +332,9 @@ class HousekeeperGui:
             if y1 <= cy <= y2:
                 self.expanded[key] = not self.expanded[key]
                 return
+
+    def _toggle_help(self) -> None:
+        self._show_help = not self._show_help
 
     def _change_interval(self, delta_ms: int) -> None:
         self.interval_ms = max(100, min(10000, self.interval_ms + delta_ms))
@@ -241,8 +356,9 @@ class HousekeeperGui:
         # 上ライン
         c.create_line(0, y, c_width, y, fill=COLORS["header_line"], width=1)
 
-        # アイコン + ─── + タイトル + ───
-        header_text = f"{icon} ── {title} "
+        # セクションアイコン + 展開アイコン + ─── + タイトル + ───
+        section_icon = ICONS.get(key, "")
+        header_text = f"{icon} ── {section_icon} {title} " if section_icon else f"{icon} ── {title} "
         c.create_text(10, y + h // 2, anchor="w", text=header_text,
                       fill=COLORS["fg"], font=("monospace", 11, "bold"))
 
@@ -350,9 +466,20 @@ class HousekeeperGui:
         self.canvas.create_line(0, 0, c_width, 0,
                                 fill=COLORS["header_line"], width=2)
         self.canvas.create_text(c_width // 2, title_h // 2,
-                                text="SYSTEM MONITOR",
+                                text="🖥  SYSTEM MONITOR  🖥",
                                 fill=COLORS["fg"],
                                 font=("monospace", 13, "bold"))
+        # ? ヘルプボタン (右端)
+        btn_w, btn_h = 28, 22
+        btn_x = c_width - btn_w - 8
+        btn_y = (title_h - btn_h) // 2
+        self.canvas.create_rectangle(btn_x, btn_y, btn_x + btn_w, btn_y + btn_h,
+                                     fill=COLORS["bar_bg"], outline=COLORS["fg"])
+        self.canvas.create_text(btn_x + btn_w // 2, btn_y + btn_h // 2,
+                                text="?", fill=COLORS["fg"],
+                                font=("monospace", 12, "bold"))
+        self._help_btn_zone = (btn_x, btn_y, btn_x + btn_w, btn_y + btn_h)
+
         self.canvas.create_line(0, title_h - 1, c_width, title_h - 1,
                                 fill=COLORS["header_line"], width=2)
         y = title_h + 4
@@ -433,6 +560,14 @@ class HousekeeperGui:
                         val += f"/{crit:.0f}C"
                     y = self._draw_bar(y, dev.display_name[:12],
                                        [(frac, color)], val)
+                # ファンセンサー
+                for dev in temp_data:
+                    for fan in dev.fans:
+                        max_rpm = 5000.0
+                        frac = min(fan.rpm / max_rpm, 1.0) if max_rpm > 0 else 0.0
+                        y = self._draw_bar(y, f"{fan.label}"[:12],
+                                           [(frac, COLORS["gpu_fan"])],
+                                           f"{fan.rpm} RPM")
                 for g in nvidia_data:
                     frac = min(g.temperature_c / 100.0, 1.0)
                     color = COLORS["gpu_temp"] if g.temperature_c > 80 else COLORS["user"]
@@ -634,11 +769,80 @@ class HousekeeperGui:
             fill=COLORS["fg_sub"], font=("monospace", 9))
         y += footer_h + 5
 
+        # ヘルプオーバーレイ
+        if self._show_help:
+            self._draw_help_overlay(c_width)
+
         # スクロール領域更新
         self.canvas.configure(scrollregion=(0, 0, c_width, y + 10))
 
         # 次の更新
         self.root.after(self.interval_ms, self._update)
+
+    def _draw_help_overlay(self, c_width: int) -> None:
+        """画面中央にヘルプオーバーレイを描画。"""
+        c = self.canvas
+        c_height = c.winfo_height() or 900
+
+        # 半透明風の背景 (暗いオーバーレイ)
+        c.create_rectangle(0, 0, c_width, c_height,
+                           fill="#000000", stipple="gray50", outline="")
+
+        # ヘルプボックス
+        help_lines = [
+            "── housekeeper ──",
+            "",
+            "Click section header   Expand / Collapse",
+            "Click RAID/Bond row    Show / Hide members",
+            "Click  ?  button       Show this help",
+            "",
+            "+  /  -                Change update interval",
+            "q  /  Esc              Quit",
+            "h                      Toggle this help",
+            "",
+            "Click anywhere to close",
+        ]
+        box_w = 380
+        line_h = 22
+        box_h = len(help_lines) * line_h + 40
+        bx = (c_width - box_w) // 2
+        by = (c_height - box_h) // 2
+
+        # ボックス背景 + ボーダー
+        c.create_rectangle(bx, by, bx + box_w, by + box_h,
+                           fill=COLORS["header"], outline=COLORS["fg"], width=2)
+        # 上下オレンジライン
+        c.create_line(bx, by + 1, bx + box_w, by + 1,
+                      fill=COLORS["header_line"], width=2)
+        c.create_line(bx, by + box_h - 1, bx + box_w, by + box_h - 1,
+                      fill=COLORS["header_line"], width=2)
+
+        # テキスト
+        ty = by + 20
+        for line in help_lines:
+            if line.startswith("──"):
+                c.create_text(bx + box_w // 2, ty,
+                              text=line, fill=COLORS["fg"],
+                              font=("monospace", 13, "bold"))
+            elif line == "":
+                pass  # 空行
+            elif line.startswith("Click anywhere"):
+                c.create_text(bx + box_w // 2, ty,
+                              text=line, fill=COLORS["fg_sub"],
+                              font=("monospace", 9, "italic"))
+            else:
+                # 左側 (操作) と右側 (説明) を分割
+                parts = line.split(None, 1)
+                # 固定幅で左右に分ける
+                left = line[:23].rstrip()
+                right = line[23:].strip()
+                c.create_text(bx + 20, ty, anchor="w",
+                              text=left, fill=COLORS["fg"],
+                              font=("monospace", 11, "bold"))
+                c.create_text(bx + 210, ty, anchor="w",
+                              text=right, fill=COLORS["fg_data"],
+                              font=("monospace", 11))
+            ty += line_h
 
     def run(self) -> None:
         self.root.after(500, self._update)
