@@ -81,6 +81,11 @@ class Renderer:
         self.show_networks = True
         self.show_gpus = True
         self.show_help = False
+        # 自動スケール用ピーク値 (減衰付き)
+        self._peak_disk_bps: float = 1_000.0
+        self._peak_net_bps: float = 1_000.0
+        self._peak_nfs_bps: float = 1_000.0
+        self._peak_pcie_bps: float = 1_000.0
 
     def render(
         self,
@@ -312,15 +317,23 @@ class Renderer:
         draw_section_header(win, y, x, width, "Disk I/O", PAIR_HEADER)
         y += 1
 
+        # 自動スケール
+        cur_peak = max(max((d.read_bytes_sec for d in disks), default=0),
+                       max((d.write_bytes_sec for d in disks), default=0))
+        if cur_peak > self._peak_disk_bps:
+            self._peak_disk_bps = cur_peak
+        else:
+            self._peak_disk_bps = max(self._peak_disk_bps * 0.95, cur_peak, 1_000.0)
+        disk_scale = self._peak_disk_bps * 1.2
+
         for d in disks:
             if y >= max_y - 1:
                 break
             # RAID メンバーは折りたたみ時にスキップ
             if d.raid_member_of and not self.show_raid_members:
                 continue
-            max_bw = 1_073_741_824.0  # 1 GB/s
-            rd_frac = min(d.read_bytes_sec / max_bw, 0.5)
-            wr_frac = min(d.write_bytes_sec / max_bw, 0.5)
+            rd_frac = min(d.read_bytes_sec / disk_scale, 0.5)
+            wr_frac = min(d.write_bytes_sec / disk_scale, 0.5)
             segments = [
                 BarSegment(rd_frac, PAIR_CACHE),
                 BarSegment(wr_frac, PAIR_IOWAIT),
@@ -351,15 +364,23 @@ class Renderer:
         draw_section_header(win, y, x, width, "Network", PAIR_HEADER)
         y += 1
 
+        # 自動スケール
+        cur_peak = max(max((n.rx_bytes_sec for n in networks), default=0),
+                       max((n.tx_bytes_sec for n in networks), default=0))
+        if cur_peak > self._peak_net_bps:
+            self._peak_net_bps = cur_peak
+        else:
+            self._peak_net_bps = max(self._peak_net_bps * 0.95, cur_peak, 1_000.0)
+        net_scale = self._peak_net_bps * 1.2
+
         for n in networks:
             if y >= max_y - 1:
                 break
             # ボンドメンバーは折りたたみ時にスキップ
             if n.bond_member_of and not self.show_bond_members:
                 continue
-            max_bw = 125_000_000.0  # 1 Gbps
-            rx_frac = min(n.rx_bytes_sec / max_bw, 0.5)
-            tx_frac = min(n.tx_bytes_sec / max_bw, 0.5)
+            rx_frac = min(n.rx_bytes_sec / net_scale, 0.5)
+            tx_frac = min(n.tx_bytes_sec / net_scale, 0.5)
             segments = [
                 BarSegment(rx_frac, PAIR_NET_RX),
                 BarSegment(tx_frac, PAIR_NET_TX),
@@ -391,12 +412,20 @@ class Renderer:
         draw_section_header(win, y, x, width, "NFS/SAN/NAS", PAIR_HEADER)
         y += 1
 
+        # 自動スケール
+        cur_peak = max(max((m.read_bytes_sec for m in mounts), default=0),
+                       max((m.write_bytes_sec for m in mounts), default=0))
+        if cur_peak > self._peak_nfs_bps:
+            self._peak_nfs_bps = cur_peak
+        else:
+            self._peak_nfs_bps = max(self._peak_nfs_bps * 0.95, cur_peak, 1_000.0)
+        nfs_scale = self._peak_nfs_bps * 1.2
+
         for m in mounts:
             if y >= max_y - 1:
                 break
-            max_bw = 125_000_000.0  # 1 Gbps
-            rd_frac = min(m.read_bytes_sec / max_bw, 0.5)
-            wr_frac = min(m.write_bytes_sec / max_bw, 0.5)
+            rd_frac = min(m.read_bytes_sec / nfs_scale, 0.5)
+            wr_frac = min(m.write_bytes_sec / nfs_scale, 0.5)
             segments = [
                 BarSegment(rd_frac, PAIR_NET_RX),
                 BarSegment(wr_frac, PAIR_NET_TX),
@@ -521,12 +550,21 @@ class Renderer:
         draw_section_header(win, y, x, width, "PCIe Devices", PAIR_HEADER)
         y += 1
 
+        # 自動スケール (I/Oデータがあるデバイスのみ)
+        io_devs = [d for d in devices if d.io_label]
+        if io_devs:
+            cur_peak = max(max((d.io_read_bytes_sec for d in io_devs), default=0),
+                           max((d.io_write_bytes_sec for d in io_devs), default=0))
+            if cur_peak > self._peak_pcie_bps:
+                self._peak_pcie_bps = cur_peak
+            else:
+                self._peak_pcie_bps = max(self._peak_pcie_bps * 0.95, cur_peak, 1_000.0)
+        pcie_scale = self._peak_pcie_bps * 1.2
+
         for dev in devices:
             if y >= max_y - 1:
                 break
 
-            # I/O スループットバー (理論帯域比)
-            io_util = dev.io_utilization
             icon = dev.icon
             name = f"{icon}{dev.short_name}" if icon else dev.short_name
             link = f"{dev.gen_name} x{dev.current_width}"
@@ -534,10 +572,9 @@ class Renderer:
 
             if dev.io_label:
                 # I/O データあり: バー表示
-                io_total = dev.io_read_bytes_sec + dev.io_write_bytes_sec
                 segments = [
-                    BarSegment(min(dev.io_read_bytes_sec / max(dev.current_bandwidth_gbs * 1_073_741_824, 1), 0.5), PAIR_CACHE),
-                    BarSegment(min(dev.io_write_bytes_sec / max(dev.current_bandwidth_gbs * 1_073_741_824, 1), 0.5), PAIR_IOWAIT),
+                    BarSegment(min(dev.io_read_bytes_sec / pcie_scale, 0.5), PAIR_CACHE),
+                    BarSegment(min(dev.io_write_bytes_sec / pcie_scale, 0.5), PAIR_IOWAIT),
                 ]
                 val = f"{link} R:{_fmt_bytes_sec(dev.io_read_bytes_sec)} W:{_fmt_bytes_sec(dev.io_write_bytes_sec)}"
                 draw_bar(win, y, x, width, segments,

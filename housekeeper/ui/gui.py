@@ -199,6 +199,7 @@ class HousekeeperGui:
         self._peak_net_bps: float = 1_000.0    # 最低 1KB/s
         self._peak_disk_bps: float = 1_000.0
         self._peak_nfs_bps: float = 1_000.0
+        self._peak_pcie_bps: float = 1_000.0
 
         # ウィンドウ設定
         self.root = tk.Tk()
@@ -719,6 +720,16 @@ class HousekeeperGui:
 
         # ─── PCIe ─────────────────────────────────────────
         if pcie_data:
+            # 自動スケール
+            io_devs = [d for d in pcie_data if d.io_label]
+            if io_devs:
+                cur_pcie_peak = max(max((d.io_read_bytes_sec for d in io_devs), default=0),
+                                    max((d.io_write_bytes_sec for d in io_devs), default=0))
+                if cur_pcie_peak > self._peak_pcie_bps:
+                    self._peak_pcie_bps = cur_pcie_peak
+                else:
+                    self._peak_pcie_bps = max(self._peak_pcie_bps * 0.95, cur_pcie_peak, 1_000.0)
+            pcie_scale = self._peak_pcie_bps * 1.2
             summary = f"{len(pcie_data)} devices"
             y = self._draw_section_header(y, "pcie", "PCIe Devices", summary)
             if self.expanded["pcie"]:
@@ -726,11 +737,10 @@ class HousekeeperGui:
                     icon = d.icon
                     link = f"{d.gen_name} x{d.current_width}"
                     if d.io_label:
-                        max_bw = max(d.current_bandwidth_gbs * 1_073_741_824, 1)
                         bar_label = f"{icon}{d.short_name}" if icon else d.short_name
                         y = self._draw_bar(y, bar_label,
-                                           [(min(d.io_read_bytes_sec / max_bw, 0.5), COLORS["cache"]),
-                                            (min(d.io_write_bytes_sec / max_bw, 0.5), COLORS["iowait"])],
+                                           [(min(d.io_read_bytes_sec / pcie_scale, 0.5), COLORS["cache"]),
+                                            (min(d.io_write_bytes_sec / pcie_scale, 0.5), COLORS["iowait"])],
                                            f"{link} R:{_fmt_bytes_sec(d.io_read_bytes_sec)} W:{_fmt_bytes_sec(d.io_write_bytes_sec)}",
                                            label_width=140)
                     else:
