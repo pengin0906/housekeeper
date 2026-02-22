@@ -219,6 +219,8 @@ def _run_tui(stdscr: curses.window, args: argparse.Namespace) -> None:
             renderer.show_networks = not renderer.show_networks
         elif key == ord("g") or key == ord("G"):
             renderer.show_gpus = not renderer.show_gpus
+        elif key == ord("i") or key == ord("I"):
+            renderer.show_disks = not renderer.show_disks
         elif key == ord("h") or key == ord("H"):
             renderer.show_help = not renderer.show_help
         elif key == ord("+") or key == ord("="):

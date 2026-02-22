@@ -77,6 +77,7 @@ class Renderer:
         self.show_per_core = show_per_core
         self.show_raid_members = False
         self.show_bond_members = False
+        self.show_disks = True
         self.show_temperatures = True
         self.show_networks = True
         self.show_gpus = True
@@ -143,7 +144,7 @@ class Renderer:
             y = self._render_swap(win, y, x, width, label_w, val_w, swap)
 
         # Disk
-        if disks:
+        if self.show_disks and disks:
             y = self._render_disks(win, y, x, width, label_w, val_w, disks)
 
         # Network
@@ -194,7 +195,7 @@ class Renderer:
 
         # フッター
         if y < max_y - 1:
-            footer = " h:help  q:quit  c:cores  d:raid/bond  t:temp  n:net  g:gpu  p:pcie  +/-:interval "
+            footer = " h:help  q:quit  c:cores  d:raid/bond  i:disk  t:temp  n:net  g:gpu  p:pcie  +/-:interval "
             try:
                 win.addnstr(max_y - 1, x, footer[:width], width,
                              curses.color_pair(PAIR_HEADER) | curses.A_DIM)
@@ -817,6 +818,7 @@ class Renderer:
             "  q / ESC  Quit",
             "  c        Toggle per-core CPU",
             "  d        Toggle RAID/Bond members",
+            "  i        Toggle Disk I/O",
             "  t        Toggle temperature",
             "  n        Toggle network",
             "  g        Toggle GPU",
