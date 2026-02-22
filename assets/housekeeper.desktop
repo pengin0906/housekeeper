@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Housekeeper
+Comment=System Monitor with GPU/PCIe/NFS/Temperature support
+Exec=housekeeper
+Icon=housekeeper
+Terminal=false
+Type=Application
+Categories=System;Monitor;
+Keywords=system;monitor;gpu;nvidia;temperature;cpu;
