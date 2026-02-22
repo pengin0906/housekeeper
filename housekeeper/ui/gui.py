@@ -102,12 +102,11 @@ ICONS = {
 }
 
 
-def _create_app_icon(root: tk.Tk) -> None:
-    """32x32 アプリアイコンをプログラム的に生成して設定。"""
-    size = 32
+def _create_icon_image(size: int) -> tk.PhotoImage:
+    """指定サイズのモニターアイコンを生成。"""
     img = tk.PhotoImage(width=size, height=size)
+    s = size  # 短縮名
 
-    # カラー定義
     bg = "#0a0a14"
     orange = "#ff6600"
     dark_orange = "#cc5500"
@@ -116,37 +115,51 @@ def _create_app_icon(root: tk.Tk) -> None:
     bar_red = "#cc3333"
     bar_cyan = "#00cccc"
     frame_color = "#333344"
+    screen_bg = "#0d0d1a"
+
+    # スケール係数 (32px 基準)
+    def sc(v: int) -> int:
+        return v * s // 32
 
     # 背景
-    img.put(bg, to=(0, 0, size, size))
+    img.put(bg, to=(0, 0, s, s))
 
-    # モニター外枠 (オレンジ) 4,2 ~ 27,24
-    img.put(orange, to=(4, 2, 28, 4))     # 上辺
-    img.put(orange, to=(4, 22, 28, 24))    # 下辺
-    img.put(orange, to=(4, 2, 6, 24))      # 左辺
-    img.put(orange, to=(26, 2, 28, 24))    # 右辺
+    # モニター外枠 (オレンジ)
+    img.put(orange, to=(sc(4), sc(2), sc(28), sc(4)))      # 上辺
+    img.put(orange, to=(sc(4), sc(22), sc(28), sc(24)))     # 下辺
+    img.put(orange, to=(sc(4), sc(2), sc(6), sc(24)))       # 左辺
+    img.put(orange, to=(sc(26), sc(2), sc(28), sc(24)))     # 右辺
 
-    # モニター内側 (暗い)
-    img.put("#0d0d1a", to=(6, 4, 26, 22))
+    # モニター内側
+    img.put(screen_bg, to=(sc(6), sc(4), sc(26), sc(22)))
 
-    # バーグラフ (4本、下から上に伸びる)
+    # バーグラフ (4本)
     bars = [
-        (8, 18, bar_green),    # bar1: 高さ 18→8 (10px)
-        (13, 12, bar_yellow),  # bar2: 高さ 12→12 (10px → 高さ調整)
-        (18, 15, bar_red),     # bar3
-        (23, 10, bar_cyan),    # bar4
+        (sc(8), sc(8), bar_green),
+        (sc(13), sc(12), bar_yellow),
+        (sc(18), sc(15), bar_red),
+        (sc(23), sc(10), bar_cyan),
     ]
+    bar_w = max(sc(3), 2)
     for bx, top, color in bars:
-        img.put(color, to=(bx, top, bx + 3, 21))
+        img.put(color, to=(bx, top, bx + bar_w, sc(21)))
 
     # モニター台座
-    img.put(dark_orange, to=(12, 25, 20, 27))
-    img.put(frame_color, to=(10, 27, 22, 29))
+    img.put(dark_orange, to=(sc(12), sc(25), sc(20), sc(27)))
+    img.put(frame_color, to=(sc(10), sc(27), sc(22), sc(29)))
 
+    return img
+
+
+def _create_app_icon(root: tk.Tk) -> None:
+    """アプリアイコンを生成して設定 (GC防止で参照を保持)。"""
     try:
-        root.iconphoto(True, img)
+        icons = [_create_icon_image(sz) for sz in (64, 32, 16)]
+        root.iconphoto(True, *icons)
+        # GC で消えないように root に参照を保持
+        root._hk_icons = icons  # type: ignore[attr-defined]
     except tk.TclError:
-        pass  # 一部環境ではアイコン設定が失敗する
+        pass
 
 
 class HousekeeperGui:
