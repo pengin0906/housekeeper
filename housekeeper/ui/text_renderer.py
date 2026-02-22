@@ -143,7 +143,11 @@ def render_text(
         for d in disks:
             max_bw = 1_073_741_824.0
             frac = min(d.total_bytes_sec / max_bw, 1.0)
-            lines.append(f"  {d.name.upper():<10s} {_bar(frac, bar_w, _CYAN)} R:{_fmt_bytes_sec(d.read_bytes_sec)} W:{_fmt_bytes_sec(d.write_bytes_sec)}")
+            if d.raid_member_of:
+                label = f" └{d.name}"
+            else:
+                label = d.display_name.upper()
+            lines.append(f"  {label:<10s} {_bar(frac, bar_w, _CYAN)} R:{_fmt_bytes_sec(d.read_bytes_sec)} W:{_fmt_bytes_sec(d.write_bytes_sec)}")
 
     # Network
     if networks:
@@ -152,7 +156,13 @@ def render_text(
             tag = n.net_type.value if hasattr(n, "net_type") else "???"
             max_bw = 125_000_000.0
             frac = min(n.total_bytes_sec / max_bw, 1.0)
-            lines.append(f"  {tag:3s} {n.name:<6s} {_bar(frac, bar_w, _CYAN)} D:{_fmt_bytes_sec(n.rx_bytes_sec)} U:{_fmt_bytes_sec(n.tx_bytes_sec)}")
+            if n.bond_member_of:
+                label = f"     └{n.name}"
+            elif n.bond_mode:
+                label = f"{tag:3s} {n.display_name}"
+            else:
+                label = f"{tag:3s} {n.name}"
+            lines.append(f"  {label:<20s} {_bar(frac, bar_w, _CYAN)} D:{_fmt_bytes_sec(n.rx_bytes_sec)} U:{_fmt_bytes_sec(n.tx_bytes_sec)}")
 
     # NFS
     if nfs_mounts:
@@ -195,12 +205,14 @@ def render_text(
     if pcie_devices:
         lines.append(_header("PCIe Devices"))
         for d in pcie_devices:
+            icon = d.icon
+            label = f"{icon} {d.short_name[:26]}" if icon else d.short_name[:28]
             link = f"{d.gen_name:4s} x{d.current_width:<2d} {d.current_bandwidth_gbs:5.1f} GB/s"
             if d.io_label:
                 io_info = f"  R:{_fmt_bytes_sec(d.io_read_bytes_sec)} W:{_fmt_bytes_sec(d.io_write_bytes_sec)}"
-                lines.append(f"  {d.short_name[:28]:<28s} {link}  [{d.io_label}]{io_info}")
+                lines.append(f"  {label:<28s} {link}  [{d.io_label}]{io_info}")
             else:
-                lines.append(f"  {d.short_name[:28]:<28s} {link}")
+                lines.append(f"  {label:<28s} {link}")
 
     # NVIDIA GPU
     if nvidia_gpus:
@@ -212,6 +224,8 @@ def render_text(
             lines.append(f"    VRAM     {_bar(g.mem_used_pct / 100, bar_w, _YELLOW)} {_fmt_mib(g.mem_used_mib)}/{_fmt_mib(g.mem_total_mib)}")
             lines.append(f"    TEMP     {_bar(g.temperature_c / 100, bar_w, _RED)} {g.temperature_c:.0f}C")
             lines.append(f"    POWER    {_bar(g.power_pct / 100, bar_w, _MAGENTA)} {g.power_draw_w:.0f}/{g.power_limit_w:.0f}W")
+            if g.fan_speed_pct >= 0:
+                lines.append(f"    FAN      {_bar(g.fan_speed_pct / 100, bar_w, _CYAN)} {g.fan_speed_pct:.0f}%")
 
     # AMD GPU
     if amd_gpus:

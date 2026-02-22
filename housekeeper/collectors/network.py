@@ -42,12 +42,21 @@ class NetUsage:
     rx_bytes_sec: float = 0.0
     tx_bytes_sec: float = 0.0
 
+    # Bonding / LACP メタデータ
+    bond_mode: str = ""               # "802.3ad", "balance-rr" 等
+    bond_members: list[str] | None = None
+    bond_member_of: str = ""          # メンバーの場合: 所属するボンドIF名
+
     @property
     def total_bytes_sec(self) -> float:
         return self.rx_bytes_sec + self.tx_bytes_sec
 
     @property
     def display_name(self) -> str:
+        if self.bond_mode:
+            mode = self.bond_mode.split()[0] if self.bond_mode else ""
+            n = len(self.bond_members) if self.bond_members else 0
+            return f"[{self.net_type.value}]{self.name} {mode}×{n}"
         return f"[{self.net_type.value}]{self.name}"
 
 
@@ -124,6 +133,34 @@ def _get_iface_ip(iface: str) -> str | None:
         return None
 
 
+def _discover_bonds() -> dict[str, tuple[str, list[str]]]:
+    """sysfs から bonding インターフェース情報を取得。
+
+    Returns: {bond_name: (mode, [member_names])}
+    """
+    result: dict[str, tuple[str, list[str]]] = {}
+    net_path = Path("/sys/class/net")
+    if not net_path.exists():
+        return result
+
+    for iface_dir in sorted(net_path.iterdir()):
+        bonding_dir = iface_dir / "bonding"
+        if not bonding_dir.exists():
+            continue
+        try:
+            mode = (bonding_dir / "mode").read_text().strip()
+        except OSError:
+            mode = ""
+        try:
+            slaves_text = (bonding_dir / "slaves").read_text().strip()
+            members = slaves_text.split() if slaves_text else []
+        except OSError:
+            members = []
+        result[iface_dir.name] = (mode, members)
+
+    return result
+
+
 class NetworkCollector:
     """Network I/O コレクター (WAN/LAN/VIRTUAL 分類付き)。"""
 
@@ -132,6 +169,9 @@ class NetworkCollector:
         self._prev_time: float = 0.0
         self._classification: dict[str, NetType] = {}
         self._classify_interval: float = 0.0  # 最後に分類した時間
+        self._bond_info: dict[str, tuple[str, list[str]]] = {}
+        self._member_to_bond: dict[str, str] = {}
+        self._update_bonds()
 
     def _read_netdev(self) -> dict[str, NetStats]:
         result: dict[str, NetStats] = {}
@@ -151,11 +191,20 @@ class NetworkCollector:
                 )
         return result
 
+    def _update_bonds(self) -> None:
+        """ボンディング情報を更新。"""
+        self._bond_info = _discover_bonds()
+        self._member_to_bond = {}
+        for bond_name, (_, members) in self._bond_info.items():
+            for m in members:
+                self._member_to_bond[m] = bond_name
+
     def _update_classification(self) -> None:
-        """10秒ごとにインターフェース分類を更新。"""
+        """10秒ごとにインターフェース分類とボンディング情報を更新。"""
         now = time.monotonic()
         if now - self._classify_interval > 10.0:
             self._classification = _classify_interfaces()
+            self._update_bonds()
             self._classify_interval = now
 
     def collect(self) -> list[NetUsage]:
@@ -174,16 +223,38 @@ class NetworkCollector:
             net_type = self._classification.get(name, NetType.UNKNOWN)
             prev = self._prev.get(name)
             if prev is None or dt <= 0:
-                usages.append(NetUsage(name=name, net_type=net_type))
-                continue
+                nu = NetUsage(name=name, net_type=net_type)
+            else:
+                c = curr[name]
+                nu = NetUsage(
+                    name=name,
+                    net_type=net_type,
+                    rx_bytes_sec=(c.rx_bytes - prev.rx_bytes) / dt,
+                    tx_bytes_sec=(c.tx_bytes - prev.tx_bytes) / dt,
+                )
 
-            c = curr[name]
-            usages.append(NetUsage(
-                name=name,
-                net_type=net_type,
-                rx_bytes_sec=(c.rx_bytes - prev.rx_bytes) / dt,
-                tx_bytes_sec=(c.tx_bytes - prev.tx_bytes) / dt,
-            ))
+            # ボンディングメタデータ付与
+            if name in self._bond_info:
+                mode, members = self._bond_info[name]
+                nu.bond_mode = mode
+                nu.bond_members = members
+            elif name in self._member_to_bond:
+                nu.bond_member_of = self._member_to_bond[name]
+
+            usages.append(nu)
+
+        # ボンドIF の直後にメンバーを配置
+        if self._bond_info:
+            def _sort_key(n: NetUsage) -> tuple[int, str, int, str]:
+                t = type_order.get(n.net_type, 3)
+                if n.bond_mode:
+                    return (t, n.name, 0, "")
+                if n.bond_member_of:
+                    bt = type_order.get(
+                        self._classification.get(n.bond_member_of, NetType.UNKNOWN), 3)
+                    return (bt, n.bond_member_of, 1, n.name)
+                return (t, n.name, 0, "")
+            usages.sort(key=_sort_key)
 
         self._prev = curr
         self._prev_time = now

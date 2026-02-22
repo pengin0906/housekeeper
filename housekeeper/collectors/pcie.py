@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 import time
@@ -108,10 +109,30 @@ class PcieDeviceInfo:
         return min(io_total_gbs / bw, 1.0)
 
     @property
+    def icon(self) -> str:
+        """デバイスタイプに応じたアイコン。"""
+        return {
+            "display": "🖥",
+            "storage": "💾",
+            "network": "🌐",
+        }.get(self.device_type, "")
+
+    @property
     def short_name(self) -> str:
         n = self.name
-        for prefix in ["NVIDIA ", "Advanced Micro Devices, Inc. ", "Intel Corporation "]:
+        for prefix in [
+            "NVIDIA Corporation ",
+            "NVIDIA ",
+            "Advanced Micro Devices, Inc. ",
+            "Intel Corporation ",
+        ]:
             n = n.removeprefix(prefix)
+        # "(rev XX)" 除去
+        n = re.sub(r"\s*\(rev [0-9a-fA-F]+\)\s*$", "", n)
+        # [marketing name] があればそちらを優先
+        m = re.search(r"\[(.+?)\]", n)
+        if m:
+            n = m.group(1)
         if len(n) > 30:
             n = n[:27] + "..."
         return n

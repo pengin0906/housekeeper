@@ -58,7 +58,9 @@ def draw_bar(
     # ラベル描画
     try:
         lbl = label[:label_width].ljust(label_width)
-        win.addnstr(y, x, lbl, min(label_width, max_x - x),
+        # addnstr の n はバイト数として扱われるため encode 後の長さを渡す
+        lbl_bytes = len(lbl.encode())
+        win.addnstr(y, x, lbl, min(lbl_bytes, max_x - x),
                      curses.color_pair(label_color) | curses.A_BOLD)
     except curses.error:
         pass

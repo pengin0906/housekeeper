@@ -1,9 +1,10 @@
-"""tkinter ベースの X11 GUI - xosview 風のバーメーターをウィンドウに描画。
+"""tkinter ベースの X11 GUI - EVA風システムモニター。
 
-CLIから `housekeeper -x` または `housekeeper --gui` で起動する。
+CLIから `housekeeper` (デフォルト) または `housekeeper -x` で起動する。
 tkinter は Python 標準ライブラリなので追加依存なし。
 
 各セクションヘッダーをクリックすると展開/折りたたみできる。
+RAID / Bond 行をクリックするとメンバーを展開/折りたたみできる。
 折りたたみ時はサマリー行(合計のみ)を表示する。
 """
 
@@ -17,13 +18,23 @@ from pathlib import Path
 from typing import Any
 
 
-# 色定義
+# ─── EVA カラーパレット ────────────────────────────────────
 COLORS = {
-    "bg": "#1a1a2e",
-    "fg": "#e0e0e0",
-    "header": "#16213e",
-    "header_hover": "#1e2d4e",
-    "bar_bg": "#2a2a3e",
+    # 基本
+    "bg": "#0a0a14",
+    "fg": "#ff6600",
+    "fg_data": "#e0e0e0",
+    "fg_sub": "#cc8800",
+    # ヘッダー
+    "header": "#1a0a2e",
+    "header_line": "#ff6600",
+    # バー
+    "bar_bg": "#1a1a2e",
+    "bar_border": "#333344",
+    # テキスト
+    "text_dim": "#666655",
+    "text_warn": "#ff3333",
+    # データ色
     "user": "#00cc66",
     "nice": "#cccc00",
     "system": "#cc3333",
@@ -36,12 +47,11 @@ COLORS = {
     "gpu_mem": "#cccc00",
     "gpu_temp": "#cc3333",
     "gpu_power": "#cc66cc",
+    "gpu_fan": "#00cccc",
     "net_rx": "#00cccc",
     "net_tx": "#00cc66",
     "pcie": "#6699cc",
-    "text_dim": "#888888",
     "warn": "#ff6600",
-    "collapse_icon": "#aaaaaa",
 }
 
 
@@ -75,23 +85,25 @@ def _fmt_rate(v: float) -> str:
 
 
 class HousekeeperGui:
-    """メイン GUI アプリケーション。セクションはクリックで展開/折りたたみ。"""
+    """EVA風 GUI システムモニター。"""
 
-    # 全セクション名と初期展開状態
     SECTIONS = {
         "kernel": True,
-        "cpu": False,      # デフォルトは折りたたみ (合計のみ)
+        "cpu": False,
         "memory": True,
-        "temp": True,      # 温度センサー
-        "disk": False,     # デフォルトは折りたたみ (合計のみ)
+        "temp": True,
+        "disk": False,
         "network": True,
         "nfs": True,
-        "pcie": False,     # デフォルトは折りたたみ
+        "pcie": False,
         "nvidia": True,
         "amd": True,
         "gaudi": True,
         "gpu_proc": False,
         "proc": False,
+        # RAID / Bond メンバー展開
+        "raid_members": False,
+        "bond_members": False,
     }
 
     def __init__(self, args: argparse.Namespace) -> None:
@@ -99,8 +111,9 @@ class HousekeeperGui:
         self.interval_ms = int(args.interval * 1000)
         self.expanded: dict[str, bool] = dict(self.SECTIONS)
 
-        # セクションヘッダーのクリック領域 [(y1, y2, section_key), ...]
+        # クリック領域: セクションヘッダー + トグル行
         self._header_zones: list[tuple[int, int, str]] = []
+        self._toggle_zones: list[tuple[int, int, str]] = []
 
         # ウィンドウ設定
         self.root = tk.Tk()
@@ -196,9 +209,13 @@ class HousekeeperGui:
     # ─── イベント ───────────────────────────────────────────
 
     def _on_click(self, event: Any) -> None:
-        """Canvas クリック: ヘッダー行ならセクション展開/折りたたみ。"""
-        # Canvas座標に変換 (スクロール対応)
+        """Canvas クリック: ヘッダー行 or トグル行で展開/折りたたみ。"""
         cy = self.canvas.canvasy(event.y)
+        # トグル行を先にチェック (ヘッダー内にある場合があるため)
+        for y1, y2, key in self._toggle_zones:
+            if y1 <= cy <= y2:
+                self.expanded[key] = not self.expanded[key]
+                return
         for y1, y2, key in self._header_zones:
             if y1 <= cy <= y2:
                 self.expanded[key] = not self.expanded[key]
@@ -211,80 +228,105 @@ class HousekeeperGui:
 
     def _draw_section_header(self, y: int, key: str, title: str,
                              summary: str = "") -> int:
-        """クリック可能なセクションヘッダーを描画。展開時は ▼、折りたたみ時は ▶。"""
+        """EVA風セクションヘッダー: オレンジのライン + タイトル。"""
         c = self.canvas
         c_width = c.winfo_width() or 850
         expanded = self.expanded.get(key, True)
         icon = "▼" if expanded else "▶"
-        h = 22
+        h = 24
 
-        # 背景 (ホバー感をだすために少し明るい色)
+        # 背景
         c.create_rectangle(0, y, c_width, y + h,
                            fill=COLORS["header"], outline="")
+        # 上ライン
+        c.create_line(0, y, c_width, y, fill=COLORS["header_line"], width=1)
 
-        # 展開アイコン + タイトル
-        c.create_text(12, y + h // 2, anchor="w", text=icon,
-                      fill=COLORS["collapse_icon"], font=("monospace", 10))
-        c.create_text(28, y + h // 2, anchor="w", text=title,
+        # アイコン + ─── + タイトル + ───
+        header_text = f"{icon} ── {title} "
+        c.create_text(10, y + h // 2, anchor="w", text=header_text,
                       fill=COLORS["fg"], font=("monospace", 11, "bold"))
 
-        # 折りたたみ時はサマリーを右側に表示
+        # タイトル右側のライン
+        text_end = 10 + len(header_text) * 8  # 概算
+        if text_end < c_width - 20:
+            line_str = "─" * max(0, (c_width - text_end - 20) // 8)
+            c.create_text(text_end, y + h // 2, anchor="w", text=line_str,
+                          fill=COLORS["fg_sub"], font=("monospace", 11))
+
+        # 折りたたみ時はサマリーを右側に
         if not expanded and summary:
             c.create_text(c_width - 15, y + h // 2, anchor="e", text=summary,
-                          fill=COLORS["text_dim"], font=("monospace", 9))
+                          fill=COLORS["fg_sub"], font=("monospace", 9))
 
-        # クリック領域を登録
+        # 下ライン
+        c.create_line(0, y + h - 1, c_width, y + h - 1,
+                      fill=COLORS["bar_border"], width=1)
+
         self._header_zones.append((y, y + h, key))
-
         return y + h + 2
 
     def _draw_bar(self, y: int, label: str, segments: list[tuple[float, str]],
-                  value: str) -> int:
+                  value: str, label_width: int = 90) -> int:
+        """EVA風バーメーター。"""
         c = self.canvas
         c_width = c.winfo_width() or 850
-        lw = 90
-        bw = max(c_width - 280, 100)
+        lw = label_width
+        bw = max(c_width - lw - 190, 100)
         h = 16
         x = 10
 
-        # Label
+        # Label (オレンジ)
         c.create_text(x, y + h // 2, anchor="w", text=label,
                       fill=COLORS["fg"], font=("monospace", 10, "bold"))
         x += lw
 
-        # Bar bg
+        # Bar 背景 + ボーダー
         c.create_rectangle(x, y + 1, x + bw, y + h - 1,
-                           fill=COLORS["bar_bg"], outline="")
+                           fill=COLORS["bar_bg"], outline=COLORS["bar_border"])
 
-        # Segments
+        # セグメント
         bx = x
         for frac, color in segments:
             if frac <= 0:
                 continue
             sw = frac * bw
-            c.create_rectangle(bx, y + 1, bx + sw, y + h - 1,
+            c.create_rectangle(bx, y + 2, bx + sw, y + h - 2,
                                fill=color, outline="")
             bx += sw
 
-        # Value
+        # 値テキスト
         c.create_text(x + bw + 10, y + h // 2, anchor="w", text=value,
-                      fill=COLORS["fg"], font=("monospace", 9))
+                      fill=COLORS["fg_data"], font=("monospace", 9))
 
         return y + h + 2
 
     def _draw_text(self, y: int, text: str,
-                   color: str = COLORS["text_dim"]) -> int:
+                   color: str = "") -> int:
+        color = color or COLORS["text_dim"]
         self.canvas.create_text(15, y + 8, anchor="w", text=text,
                                 fill=color, font=("monospace", 9))
         return y + 16
+
+    def _draw_toggle_row(self, y: int, key: str, label: str,
+                         segments: list[tuple[float, str]],
+                         value: str, label_width: int = 90) -> int:
+        """クリックでトグルできるバー行 (RAID/Bond 用)。"""
+        expanded = self.expanded.get(key, False)
+        icon = "▼" if expanded else "▶"
+        row_y = self._draw_bar(y, f"{icon}{label}", segments, value,
+                               label_width=label_width)
+        h = row_y - y
+        self._toggle_zones.append((y, y + h, key))
+        return row_y
 
     # ─── メインループ ──────────────────────────────────────
 
     def _update(self) -> None:
         self.canvas.delete("all")
         self._header_zones.clear()
+        self._toggle_zones.clear()
         c_width = self.canvas.winfo_width() or 850
-        y = 5
+        y = 0
 
         # データ収集
         cpu_data = self.cpu_col.collect()
@@ -301,12 +343,19 @@ class HousekeeperGui:
         nfs_data = self.nfs_col.collect() if self.nfs_col else []
         temp_data = self.temp_col.collect()
 
-        # ─── Title Bar ─────────────────────────────────────
-        self.canvas.create_rectangle(0, 0, c_width, 22,
+        # ─── Title Bar ────────────────────────────────────
+        title_h = 32
+        self.canvas.create_rectangle(0, 0, c_width, title_h,
                                      fill=COLORS["header"], outline="")
-        self.canvas.create_text(c_width // 2, 11, text="housekeeper - System Monitor",
-                                fill=COLORS["fg"], font=("monospace", 11, "bold"))
-        y = 25
+        self.canvas.create_line(0, 0, c_width, 0,
+                                fill=COLORS["header_line"], width=2)
+        self.canvas.create_text(c_width // 2, title_h // 2,
+                                text="SYSTEM MONITOR",
+                                fill=COLORS["fg"],
+                                font=("monospace", 13, "bold"))
+        self.canvas.create_line(0, title_h - 1, c_width, title_h - 1,
+                                fill=COLORS["header_line"], width=2)
+        y = title_h + 4
 
         # ─── Kernel ────────────────────────────────────────
         k = kern_data
@@ -338,7 +387,6 @@ class HousekeeperGui:
                                     (c.irq_pct / 100, COLORS["irq"])],
                                    f"{c.total_pct:.1f}%")
         else:
-            # 折りたたみ時: 合計バーのみ
             if cpu_total:
                 y = self._draw_bar(y, "TOTAL",
                                    [(cpu_total.user_pct / 100, COLORS["user"]),
@@ -364,7 +412,7 @@ class HousekeeperGui:
                                    [(s.used_pct / 100, COLORS["swap"])],
                                    f"{s.used_kb / 1024 / 1024:.1f}/{s.total_kb / 1024 / 1024:.1f}G")
 
-        # ─── Temperature (hwmon + GPU) ────────────────────
+        # ─── Temperature ──────────────────────────────────
         if temp_data or nvidia_data or amd_data or gaudi_data:
             all_temps: list[float] = [d.primary_temp_c for d in temp_data]
             all_temps += [g.temperature_c for g in nvidia_data]
@@ -403,80 +451,106 @@ class HousekeeperGui:
                         y = self._draw_bar(y, f"HL{d.index}",
                                            [(frac, color)], f"{d.temperature_c:.0f}C")
 
-        # ─── Disk ──────────────────────────────────────────
+        # ─── Disk I/O ─────────────────────────────────────
         if disk_data:
             total_r = sum(d.read_bytes_sec for d in disk_data)
             total_w = sum(d.write_bytes_sec for d in disk_data)
             summary = f"R:{_fmt_bytes_sec(total_r)} W:{_fmt_bytes_sec(total_w)}"
             y = self._draw_section_header(y, "disk", f"Disk I/O ({len(disk_data)} devs)", summary)
             if self.expanded["disk"]:
+                show_raid = self.expanded.get("raid_members", False)
                 for d in disk_data:
                     max_bw = 1_073_741_824.0
-                    y = self._draw_bar(y, d.name.upper(),
-                                       [(min(d.read_bytes_sec / max_bw, 0.5), COLORS["cache"]),
-                                        (min(d.write_bytes_sec / max_bw, 0.5), COLORS["iowait"])],
-                                       f"R:{_fmt_bytes_sec(d.read_bytes_sec)} W:{_fmt_bytes_sec(d.write_bytes_sec)}")
+                    segs = [(min(d.read_bytes_sec / max_bw, 0.5), COLORS["cache"]),
+                            (min(d.write_bytes_sec / max_bw, 0.5), COLORS["iowait"])]
+                    val = f"R:{_fmt_bytes_sec(d.read_bytes_sec)} W:{_fmt_bytes_sec(d.write_bytes_sec)}"
+
+                    if d.raid_level:
+                        # RAID デバイス: クリックでメンバー展開
+                        y = self._draw_toggle_row(
+                            y, "raid_members",
+                            d.display_name.upper(), segs, val)
+                    elif d.raid_member_of:
+                        # RAID メンバー: 展開時のみ表示
+                        if show_raid:
+                            y = self._draw_bar(y, f" └{d.name}", segs, val)
+                    else:
+                        y = self._draw_bar(y, d.display_name.upper(), segs, val)
             else:
-                # 折りたたみ: 合計バー
                 max_bw = 1_073_741_824.0 * len(disk_data)
                 y = self._draw_bar(y, "ALL",
                                    [(min(total_r / max_bw, 0.5), COLORS["cache"]),
                                     (min(total_w / max_bw, 0.5), COLORS["iowait"])],
                                    f"R:{_fmt_bytes_sec(total_r)} W:{_fmt_bytes_sec(total_w)}")
 
-        # ─── Network ───────────────────────────────────────
+        # ─── Network ──────────────────────────────────────
         if net_data:
             total_rx = sum(n.rx_bytes_sec for n in net_data)
             total_tx = sum(n.tx_bytes_sec for n in net_data)
             summary = f"D:{_fmt_bytes_sec(total_rx)} U:{_fmt_bytes_sec(total_tx)}"
             y = self._draw_section_header(y, "network", "Network", summary)
             if self.expanded["network"]:
+                show_bond = self.expanded.get("bond_members", False)
                 for n in net_data:
                     max_bw = 125_000_000.0
                     tag = n.net_type.value if hasattr(n, "net_type") else "???"
-                    y = self._draw_bar(y, f"{tag} {n.name}"[:10],
-                                       [(min(n.rx_bytes_sec / max_bw, 0.5), COLORS["net_rx"]),
-                                        (min(n.tx_bytes_sec / max_bw, 0.5), COLORS["net_tx"])],
-                                       f"D:{_fmt_bytes_sec(n.rx_bytes_sec)} U:{_fmt_bytes_sec(n.tx_bytes_sec)}")
+                    segs = [(min(n.rx_bytes_sec / max_bw, 0.5), COLORS["net_rx"]),
+                            (min(n.tx_bytes_sec / max_bw, 0.5), COLORS["net_tx"])]
+                    val = f"D:{_fmt_bytes_sec(n.rx_bytes_sec)} U:{_fmt_bytes_sec(n.tx_bytes_sec)}"
 
-        # ─── NFS ───────────────────────────────────────────
+                    if n.bond_mode:
+                        # Bond デバイス: クリックでメンバー展開
+                        y = self._draw_toggle_row(
+                            y, "bond_members",
+                            n.display_name, segs, val)
+                    elif n.bond_member_of:
+                        # Bond メンバー: 展開時のみ表示
+                        if show_bond:
+                            y = self._draw_bar(y, f" └{n.name}", segs, val)
+                    else:
+                        y = self._draw_bar(y, f"{tag} {n.name}", segs, val)
+
+        # ─── NFS ──────────────────────────────────────────
         if nfs_data:
             summary = f"{len(nfs_data)} mounts"
             y = self._draw_section_header(y, "nfs", "NFS/SAN/NAS", summary)
             if self.expanded["nfs"]:
                 for mt in nfs_data:
                     max_bw = 125_000_000.0
-                    y = self._draw_bar(y, f"{mt.type_label} {mt.mount_point}"[:10],
+                    y = self._draw_bar(y, f"{mt.type_label} {mt.mount_point}"[:12],
                                        [(min(mt.read_bytes_sec / max_bw, 0.5), COLORS["net_rx"]),
                                         (min(mt.write_bytes_sec / max_bw, 0.5), COLORS["net_tx"])],
                                        f"R:{_fmt_bytes_sec(mt.read_bytes_sec)} W:{_fmt_bytes_sec(mt.write_bytes_sec)}")
 
-        # ─── PCIe ──────────────────────────────────────────
+        # ─── PCIe ─────────────────────────────────────────
         if pcie_data:
             summary = f"{len(pcie_data)} devices"
             y = self._draw_section_header(y, "pcie", "PCIe Devices", summary)
             if self.expanded["pcie"]:
                 for d in pcie_data:
+                    icon = d.icon
                     link = f"{d.gen_name} x{d.current_width}"
                     if d.io_label:
-                        # I/O データあり: バー表示
                         max_bw = max(d.current_bandwidth_gbs * 1_073_741_824, 1)
-                        y = self._draw_bar(y, d.short_name[:12],
+                        bar_label = f"{icon}{d.short_name}" if icon else d.short_name
+                        y = self._draw_bar(y, bar_label,
                                            [(min(d.io_read_bytes_sec / max_bw, 0.5), COLORS["cache"]),
                                             (min(d.io_write_bytes_sec / max_bw, 0.5), COLORS["iowait"])],
-                                           f"{link} R:{_fmt_bytes_sec(d.io_read_bytes_sec)} W:{_fmt_bytes_sec(d.io_write_bytes_sec)}")
+                                           f"{link} R:{_fmt_bytes_sec(d.io_read_bytes_sec)} W:{_fmt_bytes_sec(d.io_write_bytes_sec)}",
+                                           label_width=140)
                     else:
+                        label = f"{icon} {d.short_name}" if icon else d.short_name
                         y = self._draw_text(y,
-                            f"{d.short_name[:30]:<30s} {link} {d.current_bandwidth_gbs:5.1f} GB/s",
+                            f"{label:<30s} {link} {d.current_bandwidth_gbs:5.1f} GB/s",
                             COLORS["pcie"])
 
-        # ─── NVIDIA GPU ────────────────────────────────────
+        # ─── NVIDIA GPU ───────────────────────────────────
         if nvidia_data:
             summary = "  ".join(f"GPU{g.index}:{g.gpu_util_pct:.0f}%" for g in nvidia_data)
             y = self._draw_section_header(y, "nvidia", "NVIDIA GPU", summary)
             if self.expanded["nvidia"]:
                 for g in nvidia_data:
-                    y = self._draw_text(y, f"GPU{g.index} {g.short_name}", COLORS["fg"])
+                    y = self._draw_text(y, f"GPU{g.index} {g.short_name}", COLORS["fg_data"])
                     y = self._draw_bar(y, "  UTIL",
                                        [(g.gpu_util_pct / 100, COLORS["gpu_util"])],
                                        f"{g.gpu_util_pct:.0f}%")
@@ -489,14 +563,18 @@ class HousekeeperGui:
                     y = self._draw_bar(y, "  POWER",
                                        [(g.power_pct / 100, COLORS["gpu_power"])],
                                        f"{g.power_draw_w:.0f}/{g.power_limit_w:.0f}W")
+                    if g.fan_speed_pct >= 0:
+                        y = self._draw_bar(y, "  FAN",
+                                           [(g.fan_speed_pct / 100, COLORS["gpu_fan"])],
+                                           f"{g.fan_speed_pct:.0f}%")
 
-        # ─── AMD GPU ───────────────────────────────────────
+        # ─── AMD GPU ──────────────────────────────────────
         if amd_data:
             summary = "  ".join(f"GPU{g.index}:{g.gpu_util_pct:.0f}%" for g in amd_data)
             y = self._draw_section_header(y, "amd", "AMD GPU (ROCm)", summary)
             if self.expanded["amd"]:
                 for g in amd_data:
-                    y = self._draw_text(y, f"GPU{g.index} {g.short_name}", COLORS["fg"])
+                    y = self._draw_text(y, f"GPU{g.index} {g.short_name}", COLORS["fg_data"])
                     y = self._draw_bar(y, "  UTIL",
                                        [(g.gpu_util_pct / 100, COLORS["gpu_util"])],
                                        f"{g.gpu_util_pct:.0f}%")
@@ -505,13 +583,13 @@ class HousekeeperGui:
                                            [(g.mem_used_pct / 100, COLORS["gpu_mem"])],
                                            f"{_fmt_mib(g.mem_used_mib)}/{_fmt_mib(g.mem_total_mib)}")
 
-        # ─── Intel Gaudi ───────────────────────────────────
+        # ─── Intel Gaudi ──────────────────────────────────
         if gaudi_data:
             summary = "  ".join(f"HL{d.index}:{d.aip_util_pct:.0f}%" for d in gaudi_data)
             y = self._draw_section_header(y, "gaudi", "Intel Gaudi", summary)
             if self.expanded["gaudi"]:
                 for d in gaudi_data:
-                    y = self._draw_text(y, f"HL{d.index} {d.short_name}", COLORS["fg"])
+                    y = self._draw_text(y, f"HL{d.index} {d.short_name}", COLORS["fg_data"])
                     y = self._draw_bar(y, "  AIP",
                                        [(d.aip_util_pct / 100, COLORS["gpu_util"])],
                                        f"{d.aip_util_pct:.0f}%")
@@ -520,7 +598,7 @@ class HousekeeperGui:
                                            [(d.mem_used_pct / 100, COLORS["gpu_mem"])],
                                            f"{_fmt_mib(d.mem_used_mib)}/{_fmt_mib(d.mem_total_mib)}")
 
-        # ─── GPU Processes ─────────────────────────────────
+        # ─── GPU Processes ────────────────────────────────
         if gpu_proc_data:
             summary = f"{len(gpu_proc_data)} procs"
             y = self._draw_section_header(y, "gpu_proc", "GPU Processes", summary)
@@ -530,7 +608,7 @@ class HousekeeperGui:
                         f"GPU{p.gpu_index}  PID:{p.pid:>7d}  {p.name:<18s}  VRAM:{p.gpu_mem_mib:7.0f} MiB",
                         COLORS["gpu_mem"])
 
-        # ─── Top Processes ─────────────────────────────────
+        # ─── Top Processes ────────────────────────────────
         if proc_data:
             top_name = proc_data[0].name if proc_data else ""
             top_cpu = proc_data[0].cpu_pct if proc_data else 0.0
@@ -543,11 +621,18 @@ class HousekeeperGui:
                         f"PID:{p.pid:>7d}  {p.name:<20s}  CPU:{p.cpu_pct:5.1f}%  MEM:{p.mem_rss_mib:7.1f}M",
                         color)
 
-        # ─── Footer ────────────────────────────────────────
-        y += 5
-        self.canvas.create_text(c_width // 2, y + 8, text="Click headers to expand/collapse  |  q:quit  +/-:interval",
-                                fill=COLORS["text_dim"], font=("monospace", 8))
-        y += 20
+        # ─── Footer ───────────────────────────────────────
+        y += 6
+        footer_h = 28
+        self.canvas.create_rectangle(0, y, c_width, y + footer_h,
+                                     fill=COLORS["header"], outline="")
+        self.canvas.create_line(0, y, c_width, y,
+                                fill=COLORS["header_line"], width=1)
+        self.canvas.create_text(
+            c_width // 2, y + footer_h // 2,
+            text="Click header: expand/collapse | Click RAID/Bond: show members | +/-: interval | q/Esc: quit",
+            fill=COLORS["fg_sub"], font=("monospace", 9))
+        y += footer_h + 5
 
         # スクロール領域更新
         self.canvas.configure(scrollregion=(0, 0, c_width, y + 10))

@@ -187,6 +187,17 @@ def _run_tui(stdscr: curses.window, args: argparse.Namespace) -> None:
             renderer.show_per_core = not renderer.show_per_core
         elif key == ord("p") or key == ord("P"):
             show_pcie = not show_pcie
+        elif key == ord("d") or key == ord("D"):
+            renderer.show_raid_members = not renderer.show_raid_members
+            renderer.show_bond_members = not renderer.show_bond_members
+        elif key == ord("t") or key == ord("T"):
+            renderer.show_temperatures = not renderer.show_temperatures
+        elif key == ord("n") or key == ord("N"):
+            renderer.show_networks = not renderer.show_networks
+        elif key == ord("g") or key == ord("G"):
+            renderer.show_gpus = not renderer.show_gpus
+        elif key == ord("h") or key == ord("H"):
+            renderer.show_help = not renderer.show_help
         elif key == ord("+") or key == ord("="):
             args.interval = max(0.1, args.interval - 0.5)
             stdscr.timeout(int(args.interval * 1000))
@@ -298,8 +309,12 @@ def main() -> None:
         help="Text mode output (no TUI, prints to stdout)",
     )
     parser.add_argument(
+        "-c", "--character", action="store_true",
+        help="Character TUI mode (curses)",
+    )
+    parser.add_argument(
         "-x", "--gui", action="store_true",
-        help="Launch X11 GUI window (tkinter)",
+        help="Launch X11 GUI window (tkinter) [default]",
     )
     parser.add_argument(
         "--detect", action="store_true",
@@ -320,13 +335,14 @@ def main() -> None:
 
     if args.text:
         _run_text_mode(args)
-    elif args.gui:
-        _run_gui(args)
-    else:
+    elif args.character:
         try:
             curses.wrapper(lambda stdscr: _run_tui(stdscr, args))
         except KeyboardInterrupt:
             pass
+    else:
+        # デフォルト: GUI モード (--gui/-x も引き続き受け付ける)
+        _run_gui(args)
 
 
 if __name__ == "__main__":

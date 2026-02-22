@@ -75,6 +75,12 @@ class Renderer:
 
     def __init__(self, show_per_core: bool = True) -> None:
         self.show_per_core = show_per_core
+        self.show_raid_members = False
+        self.show_bond_members = False
+        self.show_temperatures = True
+        self.show_networks = True
+        self.show_gpus = True
+        self.show_help = False
 
     def render(
         self,
@@ -136,7 +142,7 @@ class Renderer:
             y = self._render_disks(win, y, x, width, label_w, val_w, disks)
 
         # Network
-        if networks:
+        if self.show_networks and networks:
             y = self._render_networks(win, y, x, width, label_w, val_w, networks)
 
         # NFS/SAN/NAS
@@ -144,7 +150,7 @@ class Renderer:
             y = self._render_nfs(win, y, x, width, label_w, val_w, nfs_mounts)
 
         # Temperature (hwmon + GPU)
-        if temperatures or nvidia_gpus or amd_gpus or gaudi_devices:
+        if self.show_temperatures and (temperatures or nvidia_gpus or amd_gpus or gaudi_devices):
             y = self._render_temperatures(
                 win, y, x, width, label_w, val_w,
                 devices=temperatures or [],
@@ -158,28 +164,32 @@ class Renderer:
             y = self._render_pcie(win, y, x, width, label_w, val_w, pcie_devices)
 
         # NVIDIA GPU
-        if nvidia_gpus:
+        if self.show_gpus and nvidia_gpus:
             y = self._render_nvidia(win, y, x, width, label_w, val_w, nvidia_gpus)
 
         # AMD GPU
-        if amd_gpus:
+        if self.show_gpus and amd_gpus:
             y = self._render_amd(win, y, x, width, label_w, val_w, amd_gpus)
 
         # Intel Gaudi
-        if gaudi_devices:
+        if self.show_gpus and gaudi_devices:
             y = self._render_gaudi(win, y, x, width, label_w, val_w, gaudi_devices)
 
         # GPU Processes
-        if gpu_processes:
+        if self.show_gpus and gpu_processes:
             y = self._render_gpu_processes(win, y, x, width, gpu_processes)
 
         # Top Processes
         if top_processes:
             y = self._render_processes(win, y, x, width, top_processes)
 
+        # ヘルプオーバーレイ
+        if self.show_help:
+            self._render_help(win, max_y, max_x)
+
         # フッター
         if y < max_y - 1:
-            footer = " q:quit  c:toggle cores  p:toggle pcie  +/-:interval "
+            footer = " h:help  q:quit  c:cores  d:raid/bond  t:temp  n:net  g:gpu  p:pcie  +/-:interval "
             try:
                 win.addnstr(max_y - 1, x, footer[:width], width,
                              curses.color_pair(PAIR_HEADER) | curses.A_DIM)
@@ -305,6 +315,9 @@ class Renderer:
         for d in disks:
             if y >= max_y - 1:
                 break
+            # RAID メンバーは折りたたみ時にスキップ
+            if d.raid_member_of and not self.show_raid_members:
+                continue
             max_bw = 1_073_741_824.0  # 1 GB/s
             rd_frac = min(d.read_bytes_sec / max_bw, 0.5)
             wr_frac = min(d.write_bytes_sec / max_bw, 0.5)
@@ -313,8 +326,15 @@ class Renderer:
                 BarSegment(wr_frac, PAIR_IOWAIT),
             ]
             val = f"R:{_fmt_bytes_sec(d.read_bytes_sec)}"
+            if d.raid_member_of:
+                label = f" └{d.name}"[:label_w]
+            elif d.raid_level:
+                arrow = "▼" if self.show_raid_members else "▶"
+                label = f"{arrow}{d.display_name.upper()}"[:label_w]
+            else:
+                label = d.display_name.upper()[:label_w]
             draw_bar(win, y, x, width, segments,
-                     label=d.name.upper()[:label_w], label_width=label_w,
+                     label=label, label_width=label_w,
                      value_text=val, value_width=val_w + 2,
                      label_color=PAIR_LABEL)
             y += 1
@@ -334,6 +354,9 @@ class Renderer:
         for n in networks:
             if y >= max_y - 1:
                 break
+            # ボンドメンバーは折りたたみ時にスキップ
+            if n.bond_member_of and not self.show_bond_members:
+                continue
             max_bw = 125_000_000.0  # 1 Gbps
             rx_frac = min(n.rx_bytes_sec / max_bw, 0.5)
             tx_frac = min(n.tx_bytes_sec / max_bw, 0.5)
@@ -342,7 +365,13 @@ class Renderer:
                 BarSegment(tx_frac, PAIR_NET_TX),
             ]
             tag = n.net_type.value if hasattr(n, "net_type") else ""
-            label = f"{tag:3s} {n.name}"[:label_w]
+            if n.bond_member_of:
+                label = f"    └{n.name}"[:label_w]
+            elif n.bond_mode:
+                arrow = "▼" if self.show_bond_members else "▶"
+                label = f"{tag:3s} {arrow}{n.display_name}"[:label_w]
+            else:
+                label = f"{tag:3s} {n.name}"[:label_w]
             val = f"D:{_fmt_bytes_sec(n.rx_bytes_sec)} U:{_fmt_bytes_sec(n.tx_bytes_sec)}"
             draw_bar(win, y, x, width, segments,
                      label=label, label_width=label_w,
@@ -480,8 +509,10 @@ class Renderer:
 
             # I/O スループットバー (理論帯域比)
             io_util = dev.io_utilization
-            name = dev.short_name[:20]
+            icon = dev.icon
+            name = f"{icon}{dev.short_name}" if icon else dev.short_name
             link = f"{dev.gen_name} x{dev.current_width}"
+            pcie_label_w = label_w + 14
 
             if dev.io_label:
                 # I/O データあり: バー表示
@@ -492,16 +523,17 @@ class Renderer:
                 ]
                 val = f"{link} R:{_fmt_bytes_sec(dev.io_read_bytes_sec)} W:{_fmt_bytes_sec(dev.io_write_bytes_sec)}"
                 draw_bar(win, y, x, width, segments,
-                         label=name, label_width=label_w + 10,
-                         value_text=val, value_width=val_w + 20,
+                         label=name, label_width=pcie_label_w,
+                         value_text=val, value_width=val_w + 16,
                          label_color=PAIR_LABEL)
             else:
                 # I/O データなし: リンク情報のみ
                 link_info = f"{link} {dev.current_bandwidth_gbs:.1f}GB/s"
                 try:
-                    win.addnstr(y, x, f" {name}", min(width, 30),
+                    win.addnstr(y, x, f" {name}", min(width, pcie_label_w),
                                  curses.color_pair(PAIR_LABEL))
-                    win.addnstr(y, x + 30, link_info, min(width - 30, 30),
+                    win.addnstr(y, x + pcie_label_w, link_info,
+                                 min(width - pcie_label_w, 30),
                                  curses.color_pair(PAIR_CACHE) | curses.A_DIM)
                 except curses.error:
                     pass
@@ -555,6 +587,15 @@ class Renderer:
                          label=f"{name} PWR", label_width=label_w,
                          value_text=f"{gpu.power_draw_w:.0f}/{gpu.power_limit_w:.0f}W",
                          value_width=val_w + 2, label_color=PAIR_LABEL)
+                y += 1
+
+            if y < max_y - 1 and gpu.fan_speed_pct >= 0:
+                fan_frac = min(gpu.fan_speed_pct / 100.0, 1.0)
+                draw_bar(win, y, x, width,
+                         [BarSegment(fan_frac, PAIR_GPU_FAN)],
+                         label=f"{name} FAN", label_width=label_w,
+                         value_text=f"{gpu.fan_speed_pct:.0f}%",
+                         value_width=val_w, label_color=PAIR_LABEL)
                 y += 1
 
         return y
@@ -705,3 +746,51 @@ class Renderer:
             y += 1
 
         return y
+
+    def _render_help(
+        self, win: curses.window, max_y: int, max_x: int,
+    ) -> None:
+        """画面中央にヘルプオーバーレイを描画。"""
+        help_lines = [
+            "─── housekeeper keybindings ───",
+            "",
+            "  h        Toggle this help",
+            "  q / ESC  Quit",
+            "  c        Toggle per-core CPU",
+            "  d        Toggle RAID/Bond members",
+            "  t        Toggle temperature",
+            "  n        Toggle network",
+            "  g        Toggle GPU",
+            "  p        Toggle PCIe devices",
+            "  +/-      Change update interval",
+            "",
+            "  Press h to close",
+        ]
+        box_w = 40
+        box_h = len(help_lines) + 2
+        start_y = max(0, (max_y - box_h) // 2)
+        start_x = max(0, (max_x - box_w) // 2)
+
+        # 背景ボックス
+        for row in range(box_h):
+            ry = start_y + row
+            if ry >= max_y - 1:
+                break
+            try:
+                line = " " * box_w
+                win.addnstr(ry, start_x, line, min(box_w, max_x - start_x),
+                             curses.color_pair(PAIR_HEADER) | curses.A_REVERSE)
+            except curses.error:
+                pass
+
+        # テキスト
+        for i, txt in enumerate(help_lines):
+            ry = start_y + 1 + i
+            if ry >= max_y - 1:
+                break
+            try:
+                padded = f" {txt}".ljust(box_w)
+                attr = curses.color_pair(PAIR_USER) | curses.A_BOLD if i == 0 else curses.color_pair(PAIR_LABEL)
+                win.addnstr(ry, start_x, padded, min(box_w, max_x - start_x), attr)
+            except curses.error:
+                pass
