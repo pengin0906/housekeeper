@@ -24,11 +24,22 @@ from pathlib import Path
 
 def _detect_accelerators() -> dict[str, bool]:
     """利用可能なアクセラレータを検出する (コマンドの存在確認のみ)。"""
-    return {
+    accel = {
         "nvidia": bool(shutil.which("nvidia-smi")),
         "amd":    bool(shutil.which("rocm-smi")),
         "gaudi":  bool(shutil.which("hl-smi")),
     }
+    # Apple Silicon GPU (Metal) — macOS のみ
+    if sys.platform == "darwin":
+        try:
+            AppleGpuCollector = _lazy_import(
+                "housekeeper.collectors.apple_gpu", "AppleGpuCollector")
+            accel["apple"] = AppleGpuCollector.available()
+        except Exception:
+            accel["apple"] = False
+    else:
+        accel["apple"] = False
+    return accel
 
 
 def _has_pcie_devices() -> bool:
@@ -114,6 +125,7 @@ def _run_tui(stdscr: curses.window, args: argparse.Namespace) -> None:
     nvidia_col = None
     amd_col = None
     gaudi_col = None
+    apple_col = None
     gpu_proc_col = None
     pcie_col = None
     nfs_col = None
@@ -131,6 +143,10 @@ def _run_tui(stdscr: curses.window, args: argparse.Namespace) -> None:
     if accel["gaudi"] and not args.no_gpu:
         GaudiCollector = _lazy_import("housekeeper.collectors.gaudi", "GaudiCollector")
         gaudi_col = GaudiCollector()
+
+    if accel.get("apple") and not args.no_gpu:
+        AppleGpuCollector = _lazy_import("housekeeper.collectors.apple_gpu", "AppleGpuCollector")
+        apple_col = AppleGpuCollector()
 
     if _has_pcie_devices():
         PcieCollector = _lazy_import("housekeeper.collectors.pcie", "PcieCollector")
@@ -170,6 +186,7 @@ def _run_tui(stdscr: curses.window, args: argparse.Namespace) -> None:
         nvidia_data = nvidia_col.collect() if nvidia_col else None
         amd_data = amd_col.collect() if amd_col else None
         gaudi_data = gaudi_col.collect() if gaudi_col else None
+        apple_data = apple_col.collect() if apple_col else None
         gpu_proc_data = gpu_proc_col.collect() if gpu_proc_col else None
         pcie_data = pcie_col.collect() if pcie_col and show_pcie else None
         nfs_data = nfs_col.collect() if nfs_col else None
@@ -193,6 +210,7 @@ def _run_tui(stdscr: curses.window, args: argparse.Namespace) -> None:
             nvidia_gpus=nvidia_data or None,
             amd_gpus=amd_data or None,
             gaudi_devices=gaudi_data or None,
+            apple_gpus=apple_data or None,
             top_processes=proc_data or None,
             gpu_processes=gpu_proc_data or None,
             kernel=kern_data,
@@ -252,7 +270,7 @@ def _collect_all(args: argparse.Namespace) -> dict:
     kern_col = KernelCollector()
 
     accel = _detect_accelerators()
-    nvidia_col = amd_col = gaudi_col = gpu_proc_col = pcie_col = nfs_col = None
+    nvidia_col = amd_col = gaudi_col = apple_col = gpu_proc_col = pcie_col = nfs_col = None
 
     if accel["nvidia"] and not args.no_gpu:
         nvidia_col = _lazy_import("housekeeper.collectors.gpu", "GpuCollector")()
@@ -261,6 +279,8 @@ def _collect_all(args: argparse.Namespace) -> dict:
         amd_col = _lazy_import("housekeeper.collectors.amd_gpu", "AmdGpuCollector")()
     if accel["gaudi"] and not args.no_gpu:
         gaudi_col = _lazy_import("housekeeper.collectors.gaudi", "GaudiCollector")()
+    if accel.get("apple") and not args.no_gpu:
+        apple_col = _lazy_import("housekeeper.collectors.apple_gpu", "AppleGpuCollector")()
     if _has_pcie_devices():
         pcie_col = _lazy_import("housekeeper.collectors.pcie", "PcieCollector")()
     if _has_net_mounts():
@@ -290,6 +310,7 @@ def _collect_all(args: argparse.Namespace) -> dict:
         "nvidia_gpus": nvidia_col.collect() if nvidia_col else None,
         "amd_gpus": amd_col.collect() if amd_col else None,
         "gaudi_devices": gaudi_col.collect() if gaudi_col else None,
+        "apple_gpus": apple_col.collect() if apple_col else None,
         "gpu_processes": gpu_proc_col.collect() if gpu_proc_col else None,
         "pcie_devices": pcie_col.collect() if pcie_col else None,
         "nfs_mounts": nfs_col.collect() if nfs_col else None,

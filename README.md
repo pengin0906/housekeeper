@@ -6,16 +6,26 @@
 
 ## 特徴
 
-- **GPU 完全対応**: NVIDIA (nvidia-smi/pynvml), AMD ROCm (rocm-smi), Intel Gaudi (hl-smi)
+- **GPU 完全対応**: NVIDIA (nvidia-smi/pynvml), AMD ROCm (rocm-smi), Intel Gaudi (hl-smi), Apple Silicon (Metal/ioreg)
 - **PCIe デバイス一覧**: Gen1〜Gen6 対応、リンク速度・幅・帯域表示 + デバイスごとの実 I/O スループット
 - **温度監視**: CPU, NVMe SSD, GPU 等の温度を hwmon + GPU ドライバから一括表示
 - **NFS/SAN/NAS 監視**: NFS, CIFS/SMB, GlusterFS, Ceph, Lustre 等のネットワークストレージ
 - **ネットワーク分類**: WAN/LAN/仮想インターフェースを自動分類
 - **プロセス監視**: CPU/メモリ使用率上位プロセス + GPU を使用しているプロセス
 - **カーネル情報**: Load Average, Uptime, Context Switches, Interrupts
-- **3つの動作モード**: TUI (curses), テキスト出力, X11 GUI (tkinter)
+- **3つの動作モード**: TUI (curses), テキスト出力, GUI (tkinter)
 - **軽量設計**: GPU がない環境では GPU モジュールを一切ロードしない遅延ロード
-- **外部依存ゼロ**: Python 標準ライブラリのみで動作
+- **外部依存ゼロ**: Python 標準ライブラリのみで動作 (GUI モードは tkinter が必要)
+
+## 必要なもの
+
+- Python 3.10 以上
+- **GUI モード**: `tkinter` が必要 (Python 標準ライブラリだが、環境によっては別途インストールが必要)
+  - **macOS (Homebrew)**: `brew install python-tk@3.14` (Python バージョンに合わせる)
+  - **Ubuntu/Debian**: `sudo apt install python3-tk`
+  - **Fedora/RHEL**: `sudo dnf install python3-tkinter`
+  - **Windows**: Python 公式インストーラーでインストールすれば同梱
+- **TUI モード**: `curses` (Python 標準ライブラリ、Linux/macOS で利用可能)
 
 ## インストール
 
@@ -80,7 +90,8 @@ housekeeper/
     │   ├── gpu.py              # nvidia-smi / pynvml → NVIDIA GPU
     │   ├── gpu_process.py      # nvidia-smi → GPU プロセス情報
     │   ├── amd_gpu.py          # rocm-smi → AMD GPU (MI300 等)
-    │   └── gaudi.py            # hl-smi → Intel Gaudi
+    │   ├── gaudi.py            # hl-smi → Intel Gaudi
+    │   └── apple_gpu.py        # ioreg → Apple Silicon GPU (Metal)
     └── ui/
         ├── colors.py           # curses 色ペア定義
         ├── bar.py              # バーメーター描画 (Unicode ブロック文字)
@@ -99,12 +110,13 @@ housekeeper/
 
 ```
 起動フロー:
-  nvidia-smi あり? → gpu.py, gpu_process.py をロード
-  rocm-smi あり?   → amd_gpu.py をロード
-  hl-smi あり?     → gaudi.py をロード
-  NFS マウントあり? → nfs.py をロード
-  /sys/bus/pci あり? → pcie.py をロード
-  /sys/class/hwmon あり? → temperature.py をロード
+  nvidia-smi あり?       → gpu.py, gpu_process.py をロード
+  rocm-smi あり?         → amd_gpu.py をロード
+  hl-smi あり?           → gaudi.py をロード
+  macOS + IOAccelerator? → apple_gpu.py をロード
+  NFS マウントあり?       → nfs.py をロード
+  /sys/bus/pci あり?      → pcie.py をロード
+  /sys/class/hwmon あり?  → temperature.py をロード
 ```
 
 ### ネットワーク分類ロジック
@@ -133,6 +145,7 @@ PCIe Gen4 x4  = 1.969 GB/s × 4 lanes  =  7.9 GB/s
 | NVIDIA GPU | GeForce, RTX, Quadro, Tesla, A100, H100, B100, Blackwell |
 | AMD GPU | MI300X/A, MI250X, MI210, RX 7000 (ROCm) |
 | Intel Gaudi | Gaudi, Gaudi2, Gaudi3 |
+| Apple GPU | M1, M2, M3, M4 (Metal, ioreg IOAccelerator) |
 | NFS/SAN/NAS | NFS v3/v4, CIFS/SMB, iSCSI, GlusterFS, Ceph, Lustre |
 | PCIe | Gen1〜Gen6 |
 | 温度 | CPU (k10temp/coretemp), NVMe, GPU, マザーボード |

@@ -100,6 +100,7 @@ ICONS = {
     "nvidia":   "🎮",
     "amd":      "🎮",
     "gaudi":    "🧮",
+    "apple":    "🍎",
     "gpu_proc": "📊",
     "proc":     "📋",
 }
@@ -181,6 +182,7 @@ class HousekeeperGui:
         "nvidia": True,
         "amd": True,
         "gaudi": True,
+        "apple": True,
         "gpu_proc": False,
         "proc": False,
         # RAID / Bond / CPU コア展開
@@ -311,11 +313,19 @@ class HousekeeperGui:
             "amd": bool(shutil.which("rocm-smi")),
             "gaudi": bool(shutil.which("hl-smi")),
         }
+        import sys as _sys
+        # Apple Silicon GPU (Metal)
+        if _sys.platform == "darwin":
+            try:
+                _AppleCheck = _lazy_import("housekeeper.collectors.apple_gpu", "AppleGpuCollector")
+                accel["apple"] = _AppleCheck.available()
+            except Exception:
+                accel["apple"] = False
 
         from housekeeper.collectors.temperature import TemperatureCollector
         self.temp_col = TemperatureCollector()
 
-        self.nvidia_col = self.amd_col = self.gaudi_col = None
+        self.nvidia_col = self.amd_col = self.gaudi_col = self.apple_col = None
         self.gpu_proc_col = self.pcie_col = self.nfs_col = None
 
         import sys as _sys2
@@ -329,7 +339,8 @@ class HousekeeperGui:
             self.amd_col = _lazy_import("housekeeper.collectors.amd_gpu", "AmdGpuCollector")()
         if accel["gaudi"] and not self.args.no_gpu:
             self.gaudi_col = _lazy_import("housekeeper.collectors.gaudi", "GaudiCollector")()
-        import sys as _sys
+        if accel.get("apple") and not self.args.no_gpu:
+            self.apple_col = _lazy_import("housekeeper.collectors.apple_gpu", "AppleGpuCollector")()
         if _sys.platform.startswith("linux") and Path("/sys/bus/pci/devices").exists():
             self.pcie_col = _lazy_import("housekeeper.collectors.pcie", "PcieCollector")()
 
@@ -486,6 +497,7 @@ class HousekeeperGui:
             "nvidia": "NVIDIA GPU: 使用率, VRAM, 温度, 消費電力, ファン (NVML/nvidia-smi)",
             "amd": "AMD GPU: 使用率, VRAM (ROCm/rocm-smi)",
             "gaudi": "Intel Gaudi: AIP使用率, HBM使用量 (hl-smi)",
+            "apple": "Apple GPU (Metal): 使用率, レンダラー/タイラー, 統合メモリ (ioreg)",
         }
         for y1, y2, key in self._header_zones:
             if y1 <= cy <= y2 and key in section_desc:
@@ -538,7 +550,16 @@ class HousekeeperGui:
         self._show_help = not self._show_help
 
     def _toggle_summary(self) -> None:
-        self._summary_mode = not self._summary_mode
+        if self._summary_mode:
+            # サマリー → 通常: 保存済みジオメトリに復元
+            self._summary_mode = False
+            geo = getattr(self, "_pre_summary_geometry", None)
+            if geo:
+                self.root.geometry(geo)
+        else:
+            # 通常 → サマリー: 現在のジオメトリを保存
+            self._pre_summary_geometry = self.root.geometry()
+            self._summary_mode = True
 
     def _toggle_temp_unit(self) -> None:
         self._temp_unit = "F" if self._temp_unit == "C" else "C"
@@ -586,7 +607,7 @@ class HousekeeperGui:
 
     # チャート切り替え可能なセクション
     _CHARTABLE = frozenset({"cpu", "memory", "temp", "disk", "network", "nfs",
-                            "nvidia", "amd", "gaudi", "pcie"})
+                            "nvidia", "amd", "gaudi", "apple", "pcie"})
 
     # ─── 描画ヘルパー ──────────────────────────────────────
 
@@ -1073,6 +1094,7 @@ class HousekeeperGui:
             self._slow_nvidia: list = []
             self._slow_amd: list = []
             self._slow_gaudi: list = []
+            self._slow_apple: list = []
             self._slow_gpu_proc: list = []
             self._slow_nfs: list = []
         if now_mono - self._slow_cache_time >= 3.0:
@@ -1081,12 +1103,14 @@ class HousekeeperGui:
             self._slow_nvidia = self._timed_collect("nvidia", self.nvidia_col) if self.nvidia_col else []
             self._slow_amd = self._timed_collect("amd", self.amd_col) if self.amd_col else []
             self._slow_gaudi = self._timed_collect("gaudi", self.gaudi_col) if self.gaudi_col else []
+            self._slow_apple = self._timed_collect("apple", self.apple_col) if self.apple_col else []
             self._slow_gpu_proc = self._timed_collect("gpu_proc", self.gpu_proc_col) if self.gpu_proc_col else []
             self._slow_nfs = self._timed_collect("nfs", self.nfs_col) if self.nfs_col else []
         proc_data = self._slow_proc
         nvidia_data = self._slow_nvidia
         amd_data = self._slow_amd
         gaudi_data = self._slow_gaudi
+        apple_data = self._slow_apple
         gpu_proc_data = self._slow_gpu_proc
         nfs_data = self._slow_nfs
         # 超スロー (5秒キャッシュ): pcie, temp
@@ -1107,7 +1131,7 @@ class HousekeeperGui:
         self._last_draw_data = (
             cpu_data, mem_data, swap_data, disk_data, net_data,
             kern_data, proc_data, nvidia_data, amd_data, gaudi_data,
-            gpu_proc_data, nfs_data, pcie_data, temp_data,
+            apple_data, gpu_proc_data, nfs_data, pcie_data, temp_data,
         )
 
         self._draw(*self._last_draw_data)
@@ -1117,7 +1141,7 @@ class HousekeeperGui:
 
     def _draw(self, cpu_data, mem_data, swap_data, disk_data, net_data,
               kern_data, proc_data, nvidia_data, amd_data, gaudi_data,
-              gpu_proc_data, nfs_data, pcie_data, temp_data) -> None:
+              apple_data, gpu_proc_data, nfs_data, pcie_data, temp_data) -> None:
         """キャッシュ済みデータで描画。"""
         t_draw_start = time.perf_counter()
         self.canvas.delete("all")
@@ -1174,7 +1198,7 @@ class HousekeeperGui:
             if cpu_data and "cpu" not in se: n_rows += 1
             if mem_data and "memory" not in se: n_rows += 1
             if swap_data and swap_data.total_kb > 0 and "swap" not in se: n_rows += 1
-            if (temp_data or nvidia_data or amd_data or gaudi_data) and "temp" not in se: n_rows += 1
+            if (temp_data or nvidia_data or amd_data or gaudi_data or apple_data) and "temp" not in se: n_rows += 1
             if disk_data and "disk" not in se: n_rows += 1
             if net_data and "network" not in se: n_rows += 1
             if nfs_data and "nfs" not in se: n_rows += 1
@@ -1182,6 +1206,7 @@ class HousekeeperGui:
             if nvidia_data and "nvidia" not in se: n_rows += len(nvidia_data)
             if amd_data and "amd" not in se: n_rows += len(amd_data)
             if gaudi_data and "gaudi" not in se: n_rows += len(gaudi_data)
+            if apple_data and "apple" not in se: n_rows += len(apple_data)
             available_h = c_height - title_h
             self._summary_row_h = max(available_h // max(n_rows, 1), 30)
         else:
@@ -1412,7 +1437,7 @@ class HousekeeperGui:
                                    desc=f"スワップ領域: {swap_total_g:.1f}GB\nディスク上の仮想メモリ (多用はメモリ不足の兆候)")
 
         # ─── Temperature ──────────────────────────────────
-        if temp_data or nvidia_data or amd_data or gaudi_data:
+        if temp_data or nvidia_data or amd_data or gaudi_data or apple_data:
             all_temps: list[float] = []
             for d in temp_data:
                 if d.category == "DDR" and len(d.sensors) > 1:
@@ -1968,6 +1993,65 @@ class HousekeeperGui:
                                            line_series=[(f"{gk}_mem", COLORS["gpu_mem"])],
                                            line_max=0, line_fmt="{:.0f}%",
                                            desc=f"Gaudi HL{d.index} HBM (High Bandwidth Memory)\n総容量: {_fmt_mib(d.mem_total_mib)}")
+
+        # ─── Apple GPU (Metal) ────────────────────────────
+        if apple_data:
+            for g in apple_data:
+                self._record(f"apple{g.index}_util", g.gpu_util_pct)
+                self._record(f"apple{g.index}_render", g.renderer_util_pct)
+                self._record(f"apple{g.index}_tiler", g.tiler_util_pct)
+                self._record(f"apple{g.index}_mem", g.mem_used_pct)
+            summary = "  ".join(f"GPU:{g.gpu_util_pct:.0f}%" for g in apple_data)
+            if sm and "apple" not in se:
+                for g in apple_data:
+                    ak = f"apple{g.index}"
+                    cores_str = f" {g.gpu_core_count}cores" if g.gpu_core_count else ""
+                    y = self._draw_summary_row(
+                        y, f"🍎GPU",
+                        [(f"{ak}_util", COLORS["gpu_util"]),
+                         (f"{ak}_render", COLORS["gpu_mem"]),
+                         (f"{ak}_mem", COLORS["gpu_power"])],
+                        "", max_val=0, section="apple",
+                        values=[f"util:{g.gpu_util_pct:.0f}%",
+                                f"render:{g.renderer_util_pct:.0f}%",
+                                f"mem:{g.mem_used_pct:.0f}%"])
+            else:
+                y = self._draw_section_header(y, "apple", f"Apple GPU (Metal)", summary)
+            self._current_section = "apple"
+            if (not sm and self.expanded["apple"]) or "apple" in se:
+                for g in apple_data:
+                    ak = f"apple{g.index}"
+                    core_info = f" ({g.gpu_core_count}cores)" if g.gpu_core_count else ""
+                    y = self._draw_text(y, f"{g.name}{core_info}", COLORS["fg_data"])
+                    y = self._draw_bar(y, "  🍎UTIL",
+                                       [(g.gpu_util_pct / 100, COLORS["gpu_util"])],
+                                       f"{g.gpu_util_pct:.0f}%",
+                                       line_key=f"{ak}_util",
+                                       line_series=[(f"{ak}_util", COLORS["gpu_util"])],
+                                       line_max=0, line_fmt="{:.0f}%",
+                                       desc=f"Apple GPU ({g.short_name}) 全体使用率\nDevice Utilization (ioreg IOAccelerator)")
+                    y = self._draw_bar(y, "  🍎RNDR",
+                                       [(g.renderer_util_pct / 100, COLORS["gpu_mem"])],
+                                       f"{g.renderer_util_pct:.0f}%",
+                                       line_key=f"{ak}_render",
+                                       line_series=[(f"{ak}_render", COLORS["gpu_mem"])],
+                                       line_max=0, line_fmt="{:.0f}%",
+                                       desc=f"レンダラー使用率\nGPUのシェーダ/レンダリングパイプライン")
+                    y = self._draw_bar(y, "  🍎TILE",
+                                       [(g.tiler_util_pct / 100, COLORS["gpu_fan"])],
+                                       f"{g.tiler_util_pct:.0f}%",
+                                       line_key=f"{ak}_tiler",
+                                       line_series=[(f"{ak}_tiler", COLORS["gpu_fan"])],
+                                       line_max=0, line_fmt="{:.0f}%",
+                                       desc=f"タイラー使用率\nタイルベースレンダリングのジオメトリ処理")
+                    if g.mem_alloc_mib > 0:
+                        y = self._draw_bar(y, "  🍎MEM",
+                                           [(g.mem_used_pct / 100, COLORS["gpu_power"])],
+                                           f"{_fmt_mib(g.mem_used_mib)}/{_fmt_mib(g.mem_alloc_mib)}",
+                                           line_key=f"{ak}_mem",
+                                           line_series=[(f"{ak}_mem", COLORS["gpu_power"])],
+                                           line_max=0, line_fmt="{:.0f}%",
+                                           desc=f"GPU統合メモリ使用量\nApple Siliconは CPU/GPU でメモリを共有\n割当: {_fmt_mib(g.mem_alloc_mib)}")
 
         # ─── GPU Processes ────────────────────────────────
         self._current_section = ""

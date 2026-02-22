@@ -115,6 +115,7 @@ class Renderer:
         nvidia_gpus: list[GpuUsage] | None = None,
         amd_gpus: list[AmdGpuUsage] | None = None,
         gaudi_devices: list[GaudiUsage] | None = None,
+        apple_gpus: list | None = None,
         top_processes: list[ProcessInfo] | None = None,
         gpu_processes: list[GpuProcessInfo] | None = None,
         kernel: KernelInfo | None = None,
@@ -195,6 +196,10 @@ class Renderer:
         # Intel Gaudi
         if self.show_gpus and gaudi_devices:
             y = self._render_gaudi(win, y, x, width, label_w, val_w, gaudi_devices)
+
+        # Apple GPU (Metal)
+        if self.show_gpus and apple_gpus:
+            y = self._render_apple(win, y, x, width, label_w, val_w, apple_gpus)
 
         # GPU Processes
         if self.show_gpus and gpu_processes:
@@ -770,6 +775,54 @@ class Renderer:
                          [BarSegment(pwr_frac, PAIR_GPU_POWER)],
                          label=f"{name} PWR", label_width=label_w,
                          value_text=f"{dev.power_draw_w:.0f}W",
+                         value_width=val_w + 2, label_color=PAIR_LABEL)
+                y += 1
+
+        return y
+
+    # ─── Apple GPU (Metal) ────────────────────────────────────
+
+    def _render_apple(
+        self, win: curses.window, y: int, x: int, width: int,
+        label_w: int, val_w: int, gpus: list,
+    ) -> int:
+        max_y, _ = win.getmaxyx()
+        draw_section_header(win, y, x, width, "Apple GPU (Metal)", PAIR_HEADER)
+        y += 1
+
+        for g in gpus:
+            if y >= max_y - 3:
+                break
+            name = g.short_name if hasattr(g, "short_name") else "GPU"
+
+            draw_bar(win, y, x, width,
+                     [BarSegment(g.gpu_util_pct / 100, PAIR_GPU_UTIL)],
+                     label=f"{name} UTIL", label_width=label_w,
+                     value_text=f"{g.gpu_util_pct:.0f}%",
+                     value_width=val_w, label_color=PAIR_LABEL)
+            y += 1
+
+            if y < max_y - 1:
+                draw_bar(win, y, x, width,
+                         [BarSegment(g.renderer_util_pct / 100, PAIR_GPU_MEM)],
+                         label=f"{name} RNDR", label_width=label_w,
+                         value_text=f"{g.renderer_util_pct:.0f}%",
+                         value_width=val_w, label_color=PAIR_LABEL)
+                y += 1
+
+            if y < max_y - 1:
+                draw_bar(win, y, x, width,
+                         [BarSegment(g.tiler_util_pct / 100, PAIR_GPU_ENC)],
+                         label=f"{name} TILE", label_width=label_w,
+                         value_text=f"{g.tiler_util_pct:.0f}%",
+                         value_width=val_w, label_color=PAIR_LABEL)
+                y += 1
+
+            if y < max_y - 1 and g.mem_alloc_mib > 0:
+                draw_bar(win, y, x, width,
+                         [BarSegment(g.mem_used_pct / 100, PAIR_GPU_POWER)],
+                         label=f"{name} MEM", label_width=label_w,
+                         value_text=f"{_fmt_mib(g.mem_used_mib)}/{_fmt_mib(g.mem_alloc_mib)}",
                          value_width=val_w + 2, label_color=PAIR_LABEL)
                 y += 1
 
