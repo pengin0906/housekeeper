@@ -501,9 +501,29 @@ class HousekeeperGui:
 
         # ─── CPU ───────────────────────────────────────────
         cpu_total = next((c for c in cpu_data if c.label == "cpu"), None)
-        summary = f"{cpu_total.total_pct:.1f}%" if cpu_total else ""
+        # CPU温度を取得
+        cpu_temp_dev = next((d for d in temp_data if d.category == "CPU"), None)
+        cpu_temp_str = f" {cpu_temp_dev.primary_temp_c:.0f}C" if cpu_temp_dev else ""
+        summary = f"{cpu_total.total_pct:.1f}%{cpu_temp_str}" if cpu_total else ""
         y = self._draw_section_header(y, "cpu", "CPU", summary)
         if self.expanded["cpu"]:
+            # CPU温度バー
+            if cpu_temp_dev:
+                temp = cpu_temp_dev.primary_temp_c
+                crit = cpu_temp_dev.primary_crit_c or 100.0
+                frac = min(temp / crit, 1.0) if crit > 0 else min(temp / 100.0, 1.0)
+                color = COLORS["gpu_temp"] if temp > crit * 0.8 else COLORS["user"]
+                val = f"{temp:.0f}C"
+                if cpu_temp_dev.primary_crit_c > 0:
+                    val += f"/{crit:.0f}C"
+                y = self._draw_bar(y, "TEMP", [(frac, color)], val)
+                # CPUファン
+                for fan in cpu_temp_dev.fans:
+                    max_rpm = 5000.0
+                    frac = min(fan.rpm / max_rpm, 1.0) if max_rpm > 0 else 0.0
+                    y = self._draw_bar(y, f"{fan.label}"[:12],
+                                       [(frac, COLORS["gpu_fan"])],
+                                       f"{fan.rpm} RPM")
             for c in cpu_data:
                 label = "TOTAL" if c.label == "cpu" else c.label.upper()
                 y = self._draw_bar(y, label,
@@ -519,7 +539,7 @@ class HousekeeperGui:
                                    [(cpu_total.user_pct / 100, COLORS["user"]),
                                     (cpu_total.system_pct / 100, COLORS["system"]),
                                     (cpu_total.iowait_pct / 100, COLORS["iowait"])],
-                                   f"{cpu_total.total_pct:.1f}%")
+                                   f"{cpu_total.total_pct:.1f}%{cpu_temp_str}")
 
         # ─── Memory ────────────────────────────────────────
         m = mem_data
