@@ -199,7 +199,68 @@ class CpuCollector:
         return result
 
     def _read_stat_win(self) -> dict[str, CpuTimes]:
-        """Windows: ctypes GetSystemTimes で累積 CPU ticks を取得。"""
+        """Windows: NtQuerySystemInformation で per-core CPU ticks を取得。
+
+        SystemProcessorPerformanceInformation (class 8) は各コアの
+        IdleTime / KernelTime / UserTime を LARGE_INTEGER (100ns ticks) で返す。
+        KernelTime には IdleTime を含むため system = kernel - idle。
+        """
+        result: dict[str, CpuTimes] = {}
+        try:
+            import ctypes
+            import ctypes.wintypes
+
+            class SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION(ctypes.Structure):
+                _fields_ = [
+                    ("IdleTime", ctypes.c_longlong),
+                    ("KernelTime", ctypes.c_longlong),
+                    ("UserTime", ctypes.c_longlong),
+                    ("Reserved1", ctypes.c_longlong * 2),
+                    ("Reserved2", ctypes.c_ulong),
+                ]
+
+            ncpu = ctypes.windll.kernel32.GetActiveProcessorCount(0xFFFF)  # type: ignore[attr-defined]
+            if ncpu <= 0:
+                ncpu = 1
+
+            buf = (SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION * ncpu)()
+            ret_len = ctypes.c_ulong(0)
+            status = ctypes.windll.ntdll.NtQuerySystemInformation(  # type: ignore[attr-defined]
+                8,  # SystemProcessorPerformanceInformation
+                ctypes.byref(buf),
+                ctypes.sizeof(buf),
+                ctypes.byref(ret_len),
+            )
+            if status != 0:
+                # フォールバック: GetSystemTimes (total のみ)
+                return self._read_stat_win_fallback()
+
+            actual_count = ret_len.value // ctypes.sizeof(
+                SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION)
+
+            total_user = total_system = total_idle = 0
+            for i in range(actual_count):
+                info = buf[i]
+                user = info.UserTime
+                idle = info.IdleTime
+                system = info.KernelTime - info.IdleTime
+                result[f"cpu{i}"] = CpuTimes(
+                    user=user, system=system, idle=idle,
+                )
+                total_user += user
+                total_system += system
+                total_idle += idle
+
+            result["cpu"] = CpuTimes(
+                user=total_user, system=total_system, idle=total_idle,
+            )
+        except (OSError, AttributeError, Exception):
+            return self._read_stat_win_fallback()
+        return result
+
+    @staticmethod
+    def _read_stat_win_fallback() -> dict[str, CpuTimes]:
+        """Windows フォールバック: GetSystemTimes で total のみ取得。"""
         result: dict[str, CpuTimes] = {}
         try:
             import ctypes
@@ -209,7 +270,6 @@ class CpuCollector:
             if ctypes.windll.kernel32.GetSystemTimes(  # type: ignore[attr-defined]
                 ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user)
             ):
-                # kernel には idle を含む → system = kernel - idle
                 result["cpu"] = CpuTimes(
                     user=user.value,
                     system=kernel.value - idle.value,

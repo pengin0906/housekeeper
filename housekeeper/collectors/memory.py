@@ -2,13 +2,17 @@
 
 Linux: /proc/meminfo を読み取る。
 macOS: sysctl hw.memsize + vm_stat + sysctl vm.swapusage で取得。
+メモリ帯域: Linux resctrl MBM (AMD QoS / Intel RDT) で実測。
 """
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
 
 
 @dataclass
@@ -19,6 +23,9 @@ class MemoryUsage:
     buffers_kb: int = 0
     cached_kb: int = 0
     free_kb: int = 0
+    bw_gbs: float = 0.0      # メモリ帯域 合計 (GB/s) - resctrl MBM
+    bw_read_gbs: float = 0.0  # メモリ帯域 Read (GB/s)
+    bw_write_gbs: float = 0.0 # メモリ帯域 Write (GB/s)
 
     @property
     def used_pct(self) -> float:
@@ -58,8 +65,127 @@ _IS_DARWIN = sys.platform == "darwin"
 _IS_WIN = sys.platform == "win32"
 
 
+_RESCTRL_MON = Path("/sys/fs/resctrl/mon_data")
+_RESCTRL_INFO = Path("/sys/fs/resctrl/info/L3_MON")
+
+# AMD QoS mbm_*_bytes_config bitmask:
+#   bit0: total reads, bit1: total writes, bit2: slow reads, bit3: slow writes,
+#   bit4: NT IO writes, bit5: NT IO reads, bit6: dirty victims (writebacks)
+_MBM_READ_MASK = 0x25   # bit0 + bit2 + bit5 = all reads
+_MBM_WRITE_MASK = 0x5a  # bit1 + bit3 + bit4 + bit6 = all writes
+
+
 class MemoryCollector:
     """Memory / Swap コレクター。"""
+
+    def __init__(self) -> None:
+        # resctrl MBM 帯域計測用
+        self._mbm_total_files: list[Path] = []  # mbm_total_bytes (read or total)
+        self._mbm_local_files: list[Path] = []  # mbm_local_bytes (write, if split)
+        self._mbm_rw_split: bool = False
+        self._mbm_prev_total: int = 0
+        self._mbm_prev_local: int = 0
+        self._mbm_prev_time: float = 0.0
+        if not _IS_DARWIN and not _IS_WIN and _RESCTRL_MON.is_dir():
+            for d in sorted(_RESCTRL_MON.iterdir()):
+                ft = d / "mbm_total_bytes"
+                fl = d / "mbm_local_bytes"
+                if ft.exists():
+                    self._mbm_total_files.append(ft)
+                if fl.exists():
+                    self._mbm_local_files.append(fl)
+            # R/W 分離: まず既存設定を確認、なければ設定試行
+            if self._mbm_total_files and self._mbm_local_files:
+                self._mbm_rw_split = self._detect_rw_split()
+                if not self._mbm_rw_split:
+                    self._mbm_rw_split = self._try_configure_rw_split()
+
+    @staticmethod
+    def _detect_rw_split() -> bool:
+        """既に R/W 分離設定がされているか確認。"""
+        tc = _RESCTRL_INFO / "mbm_total_bytes_config"
+        lc = _RESCTRL_INFO / "mbm_local_bytes_config"
+        try:
+            t_val = int(tc.read_text().strip().split(";")[0].split("=")[1], 16)
+            l_val = int(lc.read_text().strip().split(";")[0].split("=")[1], 16)
+            # total が read マスク、local が write マスクなら分離済み
+            return t_val == _MBM_READ_MASK and l_val == _MBM_WRITE_MASK
+        except (OSError, ValueError, IndexError):
+            return False
+
+    @staticmethod
+    def _try_configure_rw_split() -> bool:
+        """mbm_total→Read, mbm_local→Write に設定変更を試行。"""
+        tc = _RESCTRL_INFO / "mbm_total_bytes_config"
+        lc = _RESCTRL_INFO / "mbm_local_bytes_config"
+        if not tc.exists() or not lc.exists():
+            return False
+        try:
+            # 現在の設定を読み取り: "0=0x7f;1=0x7f" 形式
+            cur = tc.read_text().strip()
+            domains = [s.split("=")[0] for s in cur.split(";")]
+            # sysfs は Python write_text() で書けない場合があるため shell 経由
+            read_cfg = ";".join(f"{d}={_MBM_READ_MASK:#x}" for d in domains)
+            write_cfg = ";".join(f"{d}={_MBM_WRITE_MASK:#x}" for d in domains)
+            r1 = subprocess.run(
+                f"echo '{read_cfg}' > {tc}",
+                shell=True, capture_output=True, timeout=2)
+            r2 = subprocess.run(
+                f"echo '{write_cfg}' > {lc}",
+                shell=True, capture_output=True, timeout=2)
+            if r1.returncode != 0 or r2.returncode != 0:
+                return False
+            # 検証
+            actual = tc.read_text().strip()
+            return _MBM_READ_MASK == int(actual.split(";")[0].split("=")[1], 16)
+        except (OSError, PermissionError, subprocess.TimeoutExpired, ValueError):
+            return False
+
+    def _read_mbm_bandwidth(self) -> tuple[float, float, float]:
+        """resctrl MBM からメモリ帯域 (GB/s) を計算。
+
+        Returns: (total_gbs, read_gbs, write_gbs)
+                 R/W 分離不可の場合: (total, 0.0, 0.0)
+        """
+        if not self._mbm_total_files:
+            return 0.0, 0.0, 0.0
+        total_bytes = 0
+        for f in self._mbm_total_files:
+            try:
+                total_bytes += int(f.read_text().strip())
+            except (OSError, ValueError):
+                return 0.0, 0.0, 0.0
+        local_bytes = 0
+        if self._mbm_rw_split:
+            for f in self._mbm_local_files:
+                try:
+                    local_bytes += int(f.read_text().strip())
+                except (OSError, ValueError):
+                    pass
+
+        now = time.monotonic()
+        if self._mbm_prev_time == 0.0:
+            self._mbm_prev_total = total_bytes
+            self._mbm_prev_local = local_bytes
+            self._mbm_prev_time = now
+            return 0.0, 0.0, 0.0
+        dt = now - self._mbm_prev_time
+        if dt < 0.01:
+            return 0.0, 0.0, 0.0
+
+        d_total = max(total_bytes - self._mbm_prev_total, 0)
+        d_local = max(local_bytes - self._mbm_prev_local, 0)
+        self._mbm_prev_total = total_bytes
+        self._mbm_prev_local = local_bytes
+        self._mbm_prev_time = now
+
+        gib = 1024 ** 3
+        if self._mbm_rw_split:
+            r_gbs = d_total / dt / gib   # total_bytes = reads
+            w_gbs = d_local / dt / gib   # local_bytes = writes
+            return r_gbs + w_gbs, r_gbs, w_gbs
+        else:
+            return d_total / dt / gib, 0.0, 0.0
 
     def _read_meminfo(self) -> dict[str, int]:
         if _IS_DARWIN:
@@ -204,6 +330,7 @@ class MemoryCollector:
 
     def collect(self) -> tuple[MemoryUsage, SwapUsage]:
         m = self._read_meminfo()
+        bw_total, bw_read, bw_write = self._read_mbm_bandwidth()
 
         total = m.get("MemTotal", 0)
         free = m.get("MemFree", 0)
@@ -217,6 +344,9 @@ class MemoryCollector:
             buffers_kb=buffers,
             cached_kb=cached,
             free_kb=free,
+            bw_gbs=bw_total,
+            bw_read_gbs=bw_read,
+            bw_write_gbs=bw_write,
         )
 
         swap_total = m.get("SwapTotal", 0)

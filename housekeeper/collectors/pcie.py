@@ -18,6 +18,7 @@ from pathlib import Path
 
 _IS_LINUX = sys.platform.startswith("linux")
 _IS_DARWIN = sys.platform == "darwin"
+_IS_WIN = sys.platform == "win32"
 
 # PCIe 世代ごとの per-lane 帯域 (GB/s, エンコーディングオーバーヘッド込み)
 _PCIE_SPEED_GBS: dict[str, float] = {
@@ -462,6 +463,8 @@ class PcieCollector:
     def collect(self) -> list[PcieDeviceInfo]:
         if _IS_DARWIN:
             return self._collect_darwin()
+        if _IS_WIN:
+            return self._collect_win()
         if not _IS_LINUX:
             return []
 
@@ -571,6 +574,74 @@ class PcieCollector:
                     current_width=width, max_width=width,
                     device_type="PCI",
                 ))
+            self._cached_devices = cache
+            return devices
+        except (OSError, subprocess.TimeoutExpired, Exception):
+            self._cached_devices = []
+            return []
+
+    def _collect_win(self) -> list[PcieDeviceInfo]:
+        """Windows: PowerShell Get-PnpDevice で PCI デバイスを列挙。
+
+        リンク速度/幅は WMI では直接取得不可なので空のまま。
+        I/O スループットも取得不可。デバイスリスト表示のみ。
+        """
+        if self._cached_devices is not None:
+            return [PcieDeviceInfo(
+                address=addr, name=name,
+                device_type=dt,
+            ) for addr, name, _, _, _, _, dt, _, _ in self._cached_devices]
+
+        try:
+            # PCI デバイスの InstanceId と FriendlyName を取得
+            cmd = (
+                "Get-PnpDevice -PresentOnly"
+                " | Where-Object { $_.InstanceId -like 'PCI*' -and"
+                " $_.Class -in @('Display','Net','SCSIAdapter','HDC') }"
+                " | ForEach-Object {"
+                " $_.InstanceId + '|' + $_.FriendlyName + '|' + $_.Class }"
+            )
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", cmd],
+                capture_output=True, text=True, timeout=15,
+            )
+            if out.returncode != 0:
+                self._cached_devices = []
+                return []
+
+            devices: list[PcieDeviceInfo] = []
+            cache: list[tuple] = []
+            for line in out.stdout.strip().splitlines():
+                line = line.strip()
+                if "|" not in line:
+                    continue
+                parts = line.split("|")
+                if len(parts) < 3:
+                    continue
+                instance_id = parts[0].strip()
+                name = parts[1].strip()
+                dev_class = parts[2].strip().lower()
+
+                if not name or "basic" in name.lower():
+                    continue
+
+                # PCI InstanceId → 短縮アドレス
+                addr = instance_id.replace("PCI\\", "").split("&")[0] if instance_id else ""
+
+                device_type = {
+                    "display": "display",
+                    "net": "network",
+                    "scsiadapter": "storage",
+                    "hdc": "storage",
+                }.get(dev_class, "other")
+
+                entry = (addr, name, "", "", 0, 0, device_type, "", "")
+                cache.append(entry)
+                devices.append(PcieDeviceInfo(
+                    address=addr, name=name,
+                    device_type=device_type,
+                ))
+
             self._cached_devices = cache
             return devices
         except (OSError, subprocess.TimeoutExpired, Exception):

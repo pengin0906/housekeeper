@@ -134,12 +134,33 @@ PCIe Gen5 x16 = 3.938 GB/s × 16 lanes = 63.0 GB/s (双方向)
 PCIe Gen4 x4  = 1.969 GB/s × 4 lanes  =  7.9 GB/s
 ```
 
+## メモリ帯域モニタリング (オプション)
+
+AMD QoS / Intel RDT 対応 CPU では、resctrl MBM により実メモリ帯域 (GB/s) をリアルタイム表示できます。
+
+### セットアップ
+
+```bash
+# resctrl ファイルシステムをマウント (初回のみ、root 権限必要)
+sudo mount -t resctrl resctrl /sys/fs/resctrl
+
+# 永続化する場合は /etc/fstab に追加
+echo 'resctrl /sys/fs/resctrl resctrl defaults 0 0' | sudo tee -a /etc/fstab
+```
+
+マウント後はカウンターの読み取りに root 権限は不要です。resctrl が利用できない環境では帯域表示はスキップされます。
+
+### 対応 CPU
+
+- AMD Zen 2 以降 (Ryzen 3000+, EPYC Rome+, Threadripper PRO)
+- Intel Xeon (Skylake-SP 以降) / Core (12th Gen 以降で一部対応)
+
 ## 対応ハードウェア
 
 | カテゴリ | 対応 |
 |---------|------|
 | CPU | 全 x86/ARM Linux (per-core 対応) |
-| メモリ | DDR4/DDR5/HBM |
+| メモリ | DDR4/DDR5/HBM + 帯域モニタリング (resctrl MBM) |
 | ディスク | NVMe, SATA SSD/HDD, virtio |
 | ネットワーク | 1GbE, 10GbE, 25GbE, 100GbE, InfiniBand |
 | NVIDIA GPU | GeForce, RTX, Quadro, Tesla, A100, H100, B100, Blackwell |

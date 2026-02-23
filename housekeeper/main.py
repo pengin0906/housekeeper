@@ -46,7 +46,10 @@ def _has_pcie_devices() -> bool:
     """PCIe デバイスが存在するか。"""
     if sys.platform.startswith("linux"):
         return Path("/sys/bus/pci/devices").exists()
-    # macOS/Windows: PCIe情報は別の方法で取得するが、現状は非対応
+    if sys.platform == "darwin":
+        return True  # macOS: system_profiler SPPCIDataType で取得
+    if sys.platform == "win32":
+        return True  # Windows: Get-PnpDevice で取得
     return False
 
 
