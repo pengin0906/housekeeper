@@ -170,17 +170,23 @@ class ProcessCollector:
         return self._collect_linux()
 
     def _collect_linux(self) -> list[ProcessInfo]:
+        import heapq
+
         now = time.monotonic()
         dt = now - self._prev_time if self._prev_time else 0.0
+        inv_dt = 100.0 / (dt * self._clk_tck) if dt > 0 else 0.0
+        page_kb = self._page_size >> 10  # //1024 を事前計算
 
         curr: dict[int, _ProcStat] = {}
-        processes: list[ProcessInfo] = []
+        # (cpu_pct, pid, stat) のタプルで top-N を保持
+        candidates: list[tuple[float, int, _ProcStat]] = []
 
         try:
             pids = [int(d) for d in os.listdir("/proc") if d.isdigit()]
         except OSError:
             return []
 
+        prev = self._prev
         for pid in pids:
             stat = self._read_proc(pid)
             if stat is None:
@@ -189,31 +195,35 @@ class ProcessCollector:
 
             # CPU 使用率計算
             cpu_pct = 0.0
-            if dt > 0 and pid in self._prev:
-                prev = self._prev[pid]
-                d_utime = stat.utime - prev.utime
-                d_stime = stat.stime - prev.stime
-                cpu_pct = 100.0 * (d_utime + d_stime) / (dt * self._clk_tck)
+            if inv_dt > 0:
+                p = prev.get(pid)
+                if p is not None:
+                    cpu_pct = (stat.utime - p.utime + stat.stime - p.stime) * inv_dt
 
-            mem_kb = stat.rss * self._page_size // 1024
+            candidates.append((cpu_pct, pid, stat))
+
+        self._prev = curr
+        self._prev_time = now
+
+        # top-N を heapq で高速取得 (全件ソート不要)
+        n = self.top_n if self.top_n > 0 else len(candidates)
+        top = heapq.nlargest(n, candidates, key=lambda x: x[0])
+
+        # top-N のみ cmdline を読む (ここが最大の節約)
+        processes: list[ProcessInfo] = []
+        for cpu_pct, pid, stat in top:
             cmdline = self._read_cmdline(pid)
             friendly = _get_friendly_name(cmdline, stat.comm)
-
             processes.append(ProcessInfo(
                 pid=pid,
                 name=friendly,
                 cmdline=cmdline,
                 cpu_pct=cpu_pct,
-                mem_rss_kb=mem_kb,
+                mem_rss_kb=stat.rss * page_kb,
                 state=stat.state,
             ))
 
-        self._prev = curr
-        self._prev_time = now
-
-        # CPU 使用率でソートして上位 N 件 (top_n=0 は全件)
-        processes.sort(key=lambda p: p.cpu_pct, reverse=True)
-        return processes if self.top_n <= 0 else processes[:self.top_n]
+        return processes
 
     def _collect_darwin(self) -> list[ProcessInfo]:
         """macOS: ps でプロセス情報を取得 (フルコマンドライン付き)。"""
