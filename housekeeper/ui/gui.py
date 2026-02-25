@@ -199,6 +199,7 @@ class HousekeeperGui:
         "amd": True,
         "gaudi": True,
         "apple": True,
+        "conntrack": False,
         "gpu_proc": False,
         "proc": False,
         # RAID / Bond / CPU コア展開
@@ -252,6 +253,7 @@ class HousekeeperGui:
         self._peak_disk_bps: float = 1_000.0
         self._peak_nfs_bps: float = 1_000.0
         self._peak_pcie_bps: float = 1_000.0
+        self._peak_conntrack_bps: float = 1_000.0
 
         # ウィンドウ設定
         self.root = tk.Tk()
@@ -347,7 +349,7 @@ class HousekeeperGui:
         self.temp_col = TemperatureCollector()
 
         self.nvidia_col = self.amd_col = self.gaudi_col = self.apple_col = None
-        self.gpu_proc_col = self.pcie_col = self.nfs_col = None
+        self.gpu_proc_col = self.pcie_col = self.nfs_col = self.conntrack_col = None
 
         import sys as _sys2
         if accel["nvidia"] and not self.args.no_gpu:
@@ -365,6 +367,15 @@ class HousekeeperGui:
         if _sys.platform.startswith("linux") and Path("/sys/bus/pci/devices").exists():
             self.pcie_col = _lazy_import("housekeeper.collectors.pcie", "PcieCollector")()
 
+        # Per-IP traffic (ss)
+        if _sys.platform.startswith("linux"):
+            try:
+                _CT = _lazy_import("housekeeper.collectors.conntrack", "ConntrackCollector")
+                if _CT.available():
+                    self.conntrack_col = _CT()
+            except Exception:
+                pass
+
         # NFS/ネットワークマウント検出
         self._detect_nfs_mounts()
 
@@ -378,6 +389,8 @@ class HousekeeperGui:
             self.nfs_col.collect()
         if self.pcie_col:
             self.pcie_col.collect()
+        if self.conntrack_col:
+            self.conntrack_col.collect()
 
     def _detect_nfs_mounts(self) -> None:
         """クロスプラットフォームでネットワークマウントを検出。"""
@@ -577,22 +590,25 @@ class HousekeeperGui:
         self._show_help = not self._show_help
 
     def _toggle_summary(self) -> None:
+        """モード巡回: Summary → Shrink → Full → Summary (詳細度の昇順)。"""
         if self._summary_mode:
-            # サマリー → フル: 保存済みジオメトリに復元
+            # Summary → Shrink
             self._summary_mode = False
+            self._shrink_mode = True
+            self._summary_expanded.clear()
+            self.canvas.yview_moveto(0)
+        elif self._shrink_mode:
+            # Shrink → Full: ジオメトリ復元
             self._shrink_mode = False
+            self._solo_section = ""
             geo = getattr(self, "_pre_summary_geometry", None)
             if geo:
                 self.root.geometry(geo)
-        elif self._shrink_mode:
-            # シュリンク → サマリー
-            self._shrink_mode = False
-            self._summary_mode = True
-            self.canvas.yview_moveto(0)
         else:
-            # フル → シュリンク: ジオメトリを保存
+            # Full → Summary: ジオメトリ保存
             self._pre_summary_geometry = self.root.geometry()
-            self._shrink_mode = True
+            self._summary_mode = True
+            self._solo_section = ""
             self.canvas.yview_moveto(0)
 
     def _toggle_temp_unit(self) -> None:
@@ -645,7 +661,7 @@ class HousekeeperGui:
         """履歴データを記録。"""
         if key not in self._history:
             d = deque(maxlen=self._history_len)
-            for _ in range(self._frame_count):
+            for _ in range(self._frame_count - 1):
                 d.append(0.0)
             self._history[key] = d
         self._history[key].append(value)
@@ -916,7 +932,10 @@ class HousekeeperGui:
         # 各系列を描画 (時間軸を history_len 基準で固定)
         gy_gh = gy + gh
         hl = self._history_len
-        x_step = gw / max(hl - 1, 1)
+        # 統一スケール: 右端を揃え、最小 label_width=90 基準の x_step を全グラフ共通にする
+        right_x = gx + gw  # == c_width - 110 (全グラフ共通)
+        ref_gw = max(c_width - 90 - x_offset - 110, 20)
+        x_step = ref_gw / max(hl - 1, 1)
         for hkey, color in series:
             if hkey not in self._history or len(self._history[hkey]) < 2:
                 continue
@@ -926,10 +945,13 @@ class HousekeeperGui:
             inv_range = 1.0 / val_range
             flat = []
             for i, v in enumerate(data):
-                flat.append(gx + (offset + i) * x_step)
+                px = right_x - (hl - 1 - offset - i) * x_step
+                if px < gx:
+                    continue  # ラベル幅分クリップ
                 f = (v - min_val) * inv_range
                 if f < 0.0: f = 0.0
                 elif f > 1.0: f = 1.0
+                flat.append(px)
                 flat.append(gy_gh - f * gh)
             if len(flat) >= 4:
                 c.create_line(*flat, fill=color, width=1, smooth=True, splinesteps=12)
@@ -1141,6 +1163,7 @@ class HousekeeperGui:
             self._slow_apple: list = []
             self._slow_gpu_proc: list = []
             self._slow_nfs: list = []
+            self._slow_conntrack: list = []
         if now_mono - self._slow_cache_time >= 3.0:
             self._slow_cache_time = now_mono
             self._slow_proc = self._timed_collect("proc", self.proc_col)
@@ -1150,6 +1173,7 @@ class HousekeeperGui:
             self._slow_apple = self._timed_collect("apple", self.apple_col) if self.apple_col else []
             self._slow_gpu_proc = self._timed_collect("gpu_proc", self.gpu_proc_col) if self.gpu_proc_col else []
             self._slow_nfs = self._timed_collect("nfs", self.nfs_col) if self.nfs_col else []
+            self._slow_conntrack = self._timed_collect("conntrack", self.conntrack_col) if self.conntrack_col else []
         proc_data = self._slow_proc
         nvidia_data = self._slow_nvidia
         amd_data = self._slow_amd
@@ -1157,6 +1181,7 @@ class HousekeeperGui:
         apple_data = self._slow_apple
         gpu_proc_data = self._slow_gpu_proc
         nfs_data = self._slow_nfs
+        conntrack_data = self._slow_conntrack
         # 超スロー (5秒キャッシュ): pcie, temp
         if not hasattr(self, "_vslow_cache_time"):
             self._vslow_cache_time = 0.0
@@ -1176,6 +1201,7 @@ class HousekeeperGui:
             cpu_data, mem_data, swap_data, disk_data, net_data,
             kern_data, proc_data, nvidia_data, amd_data, gaudi_data,
             apple_data, gpu_proc_data, nfs_data, pcie_data, temp_data,
+            conntrack_data,
         )
 
         self._draw(*self._last_draw_data)
@@ -1185,7 +1211,8 @@ class HousekeeperGui:
 
     def _draw(self, cpu_data, mem_data, swap_data, disk_data, net_data,
               kern_data, proc_data, nvidia_data, amd_data, gaudi_data,
-              apple_data, gpu_proc_data, nfs_data, pcie_data, temp_data) -> None:
+              apple_data, gpu_proc_data, nfs_data, pcie_data, temp_data,
+              conntrack_data=None) -> None:
         """キャッシュ済みデータで描画。"""
         self._frame_count += 1
         t_draw_start = time.perf_counter()
@@ -1285,8 +1312,8 @@ class HousekeeperGui:
         elif sm and "kernel" not in se:
             y = self._draw_summary_row(y, "LOAD",
                                        [("load", COLORS["user"])],
-                                       f"{k.load_1:.2f}  Up:{k.uptime_str}", max_val=0,
-                                       legend=["load/cpu"], section="kernel")
+                                       "", max_val=0, section="kernel",
+                                       values=[f"{k.load_1:.2f}"])
         else:
             summary = f"Load:{k.load_1:.2f}  Up:{k.uptime_str}"
             y = self._draw_section_header(y, "kernel", f"Kernel {k.kernel_version}", summary)
@@ -1339,8 +1366,10 @@ class HousekeeperGui:
                                            [("cpu_user", COLORS["user"]),
                                             ("cpu_sys", COLORS["system"]),
                                             ("cpu_iowait", COLORS["iowait"])],
-                                           f"{cpu_total.total_pct:.0f}%{cpu_temp_str}", max_val=0,
-                                           legend=["user", "sys", "iowait"], section="cpu")
+                                           "", max_val=0, section="cpu",
+                                           values=[f"usr:{cpu_total.user_pct:.0f}%",
+                                                   f"sys:{cpu_total.system_pct:.0f}%",
+                                                   f"io:{cpu_total.iowait_pct:.0f}%"])
         else:
             y = self._draw_section_header(y, "cpu", "CPU", summary)
             self._current_section = "cpu"
@@ -1548,8 +1577,8 @@ class HousekeeperGui:
             elif sm and "swap" not in se:
                 y = self._draw_summary_row(y, "💱SWAP",
                                            [("swap_used", COLORS["swap"])],
-                                           swap_summary, max_val=0,
-                                           legend=["used"], section="swap")
+                                           "", max_val=0, section="swap",
+                                           values=[f"{s.used_pct:.0f}%"])
             else:
                 y = self._draw_section_header(y, "swap", "Swap", swap_summary)
                 self._current_section = "swap"
@@ -1590,10 +1619,19 @@ class HousekeeperGui:
                     for sens in dev.sensors:
                         slabel = sens.label.replace("TEMP_", "")
                         self._record(f"temp_DDR_{slabel}", sens.temp_c)
+                else:
+                    tk = f"temp_{cat}_{dev.device_label}" if dev.device_label else f"temp_{cat}"
+                    self._record(tk, dev.primary_temp_c)
             for cat, t in _cat_maxes.items():
                 self._record(f"temp_{cat}", t)
             for g in nvidia_data:
                 self._record(f"temp_GPU{g.index}", g.temperature_c)
+            for g in amd_data:
+                if g.temperature_c > 0:
+                    self._record(f"temp_AMD{g.index}", g.temperature_c)
+            for d in gaudi_data:
+                if d.temperature_c > 0:
+                    self._record(f"temp_HL{d.index}", d.temperature_c)
             self._record("temp_max", max_temp)
             summary = f"Max:{self._fmt_temp(max_temp)}  {n_sensors} sensors"
             if _solo_skip("temp"):
@@ -1630,11 +1668,9 @@ class HousekeeperGui:
                 temp_vals = [f"{lbl}:{self._fmt_temp(t)}" for t, lbl, _, _ in _items]
                 y = self._draw_summary_row(y, "🌡TEMP",
                                            temp_series,
-                                           f"Max:{self._fmt_temp(max_temp)} ({n_sensors})",
-                                           max_val=-1, fmt_fn=self._fmt_temp_line,
+                                           "", max_val=-1, fmt_fn=self._fmt_temp_line,
                                            section="temp",
-                                           values=temp_vals if len(temp_vals) > 1 else None,
-                                           legend=[v.split(":")[0] for v in temp_vals] if len(temp_vals) <= 1 else None)
+                                           values=temp_vals)
             else:
                 y = self._draw_section_header(y, "temp", "Temperature", summary)
                 self._current_section = "temp"
@@ -1698,7 +1734,6 @@ class HousekeeperGui:
                         color = COLORS["user"]
                     val = self._fmt_temp(temp, crit)
                     tk = f"temp_{dev.category}_{dev.device_label}" if dev.device_label else f"temp_{dev.category}"
-                    self._record(tk, temp)
                     _desc = _cat_desc.get(dev.category, f"{dev.category} 温度センサー")
                     _desc += f"\nドライバ: {dev.name}"
                     if dev.device_label:
@@ -1752,7 +1787,6 @@ class HousekeeperGui:
                         frac = min(g.temperature_c / 100.0, 1.0)
                         color = self._gpu_temp_color(g.temperature_c, g)
                         atk = f"temp_AMD{g.index}"
-                        self._record(atk, g.temperature_c)
                         y = self._draw_bar(y, f"🎮🌡AMD{g.index}",
                                            [(frac, color)], self._fmt_temp(g.temperature_c),
                                            line_key=atk,
@@ -1763,7 +1797,6 @@ class HousekeeperGui:
                         frac = min(d.temperature_c / 100.0, 1.0)
                         color = self._gpu_temp_color(d.temperature_c, d)
                         gtk = f"temp_HL{d.index}"
-                        self._record(gtk, d.temperature_c)
                         y = self._draw_bar(y, f"🧮🌡HL{d.index}",
                                            [(frac, color)], self._fmt_temp(d.temperature_c),
                                            line_key=gtk,
@@ -1795,8 +1828,9 @@ class HousekeeperGui:
                 y = self._draw_summary_row(y, "💾DISK",
                                            [("disk_total_R", COLORS["cache"]),
                                             ("disk_total_W", COLORS["iowait"])],
-                                           f"R:{_fmt_bytes_sec(total_r)} W:{_fmt_bytes_sec(total_w)}",
-                                           max_val=0, legend=["read", "write"], section="disk")
+                                           "", max_val=0, section="disk",
+                                           values=[f"R:{_fmt_bytes_sec(total_r)}",
+                                                   f"W:{_fmt_bytes_sec(total_w)}"])
             else:
                 y = self._draw_section_header(y, "disk", f"Disk I/O ({len(disk_data)} devs)", summary)
                 self._current_section = "disk"
@@ -1850,8 +1884,9 @@ class HousekeeperGui:
                 y = self._draw_summary_row(y, "🌐NET",
                                            [("net_total_rx", COLORS["net_rx"]),
                                             ("net_total_tx", COLORS["net_tx"])],
-                                           f"D:{_fmt_bytes_sec(total_rx)} U:{_fmt_bytes_sec(total_tx)}",
-                                           max_val=0, legend=["down", "up"], section="network")
+                                           "", max_val=0, section="network",
+                                           values=[f"D:{_fmt_bytes_sec(total_rx)}",
+                                                   f"U:{_fmt_bytes_sec(total_tx)}"])
             else:
                 y = self._draw_section_header(y, "network", "Network", summary)
                 self._current_section = "network"
@@ -1888,6 +1923,58 @@ class HousekeeperGui:
                                            line_key=nk, line_series=ls, line_max=0,
                                            line_fmt_fn=_fmt_bytes_sec)
 
+        # ─── Connections (Per-IP Traffic) ────────────────
+        if conntrack_data:
+            ct_total_tx = sum(c.tx_bytes_sec for c in conntrack_data)
+            ct_total_rx = sum(c.rx_bytes_sec for c in conntrack_data)
+            cur_ct_peak = max(
+                max((c.tx_bytes_sec for c in conntrack_data), default=0),
+                max((c.rx_bytes_sec for c in conntrack_data), default=0))
+            if cur_ct_peak > self._peak_conntrack_bps:
+                self._peak_conntrack_bps = cur_ct_peak
+            else:
+                self._peak_conntrack_bps = max(
+                    self._peak_conntrack_bps * 0.95, cur_ct_peak, 1_000.0)
+            ct_scale = self._peak_conntrack_bps * 1.2
+            for c in conntrack_data:
+                sip = c.remote_ip.replace(":", "_")
+                self._record(f"ct_{sip}_tx", c.tx_bytes_sec)
+                self._record(f"ct_{sip}_rx", c.rx_bytes_sec)
+            self._record("ct_total_tx", ct_total_tx)
+            self._record("ct_total_rx", ct_total_rx)
+            ct_summary = (f"Top {len(conntrack_data)}  "
+                          f"D:{_fmt_bytes_sec(ct_total_rx)} U:{_fmt_bytes_sec(ct_total_tx)}")
+            if _solo_skip("conntrack"):
+                pass
+            elif sm and "conntrack" not in se:
+                y = self._draw_summary_row(y, "🔍CONN",
+                                           [("ct_total_rx", COLORS["net_rx"]),
+                                            ("ct_total_tx", COLORS["net_tx"])],
+                                           "", max_val=0, section="conntrack",
+                                           values=[f"D:{_fmt_bytes_sec(ct_total_rx)}",
+                                                   f"U:{_fmt_bytes_sec(ct_total_tx)}"])
+            else:
+                y = self._draw_section_header(y, "conntrack", "Connections (TCP)", ct_summary)
+                self._current_section = "conntrack"
+            if (not sm and not _shrk_for("conntrack") and self.expanded["conntrack"]) or "conntrack" in se:
+                for c in conntrack_data:
+                    sip = c.remote_ip.replace(":", "_")
+                    ck = f"ct_{sip}"
+                    ip_label = c.remote_ip
+                    if len(ip_label) > 20:
+                        ip_label = ip_label[:17] + ".."
+                    segs = [(min(c.rx_bytes_sec / ct_scale, 0.5), COLORS["net_rx"]),
+                            (min(c.tx_bytes_sec / ct_scale, 0.5), COLORS["net_tx"])]
+                    val = (f"D:{_fmt_bytes_sec(c.rx_bytes_sec)} "
+                           f"U:{_fmt_bytes_sec(c.tx_bytes_sec)} "
+                           f"({c.conn_count})")
+                    ls = [(f"{ck}_rx", COLORS["net_rx"]),
+                          (f"{ck}_tx", COLORS["net_tx"])]
+                    y = self._draw_bar(y, f"🔍{ip_label}", segs, val,
+                                       label_width=120,
+                                       line_key=ck, line_series=ls, line_max=0,
+                                       line_fmt_fn=_fmt_bytes_sec)
+
         # ─── NFS ──────────────────────────────────────────
         if nfs_data:
             # 自動スケール
@@ -1909,11 +1996,14 @@ class HousekeeperGui:
             elif sm and "nfs" not in se:
                 mt0 = nfs_data[0]
                 mk0 = mt0.mount_point.replace("/", "_")
+                _nfs_r = sum(m.read_bytes_sec for m in nfs_data)
+                _nfs_w = sum(m.write_bytes_sec for m in nfs_data)
                 y = self._draw_summary_row(y, "📁NFS",
-                                           [(f"nfs{mk0}_R", COLORS["cache"]),
-                                            (f"nfs{mk0}_W", COLORS["iowait"])],
-                                           f"{len(nfs_data)} mounts", max_val=0,
-                                           legend=["read", "write"], section="nfs")
+                                           [(f"nfs{mk0}_R", COLORS["net_rx"]),
+                                            (f"nfs{mk0}_W", COLORS["net_tx"])],
+                                           "", max_val=0, section="nfs",
+                                           values=[f"R:{_fmt_bytes_sec(_nfs_r)}",
+                                                   f"W:{_fmt_bytes_sec(_nfs_w)}"])
             else:
                 y = self._draw_section_header(y, "nfs", "NFS/SAN/NAS", summary)
                 self._current_section = "nfs"
@@ -1954,11 +2044,13 @@ class HousekeeperGui:
             elif sm and "pcie" not in se:
                 if io_devs:
                     pk0 = f"pcie_{io_devs[0].address}"
+                    _pci0 = io_devs[0]
                     y = self._draw_summary_row(y, "PCIe",
                                                [(f"{pk0}_R", COLORS["cache"]),
                                                 (f"{pk0}_W", COLORS["iowait"])],
-                                               f"{len(pcie_data)} devs", max_val=0,
-                                               legend=["read", "write"], section="pcie")
+                                               "", max_val=0, section="pcie",
+                                               values=[f"R:{_fmt_bytes_sec(_pci0.io_read_bytes_sec)}",
+                                                       f"W:{_fmt_bytes_sec(_pci0.io_write_bytes_sec)}"])
             else:
                 y = self._draw_section_header(y, "pcie", "PCIe Devices", summary)
                 self._current_section = "pcie"
@@ -2120,21 +2212,21 @@ class HousekeeperGui:
                 for g in amd_data:
                     ak = f"amd{g.index}"
                     _as = [(f"{ak}_util", COLORS["gpu_util"])]
-                    _al = ["util"]
-                    _av_str = f"{g.gpu_util_pct:.0f}%"
+                    _av = [f"util:{g.gpu_util_pct:.0f}%"]
                     if g.mem_total_mib > 0:
-                        _av_str += f" {g.mem_used_pct:.0f}%"
+                        # Note: mem series not tracked in summary, just show text
+                        pass
                     _pci = _gpu_pcie.get(f"GPU{g.index}")
                     if _pci:
                         pk = f"{ak}_pcie"
                         _as += [(f"{pk}_rx", COLORS["net_rx"]),
                                 (f"{pk}_tx", COLORS["net_tx"])]
-                        _al += ["pcie_r", "pcie_w"]
-                        _av_str += f" PCIe R:{_fmt_bytes_sec(_pci.io_read_bytes_sec)} W:{_fmt_bytes_sec(_pci.io_write_bytes_sec)}"
+                        _av += [f"R:{_fmt_bytes_sec(_pci.io_read_bytes_sec)}",
+                                f"W:{_fmt_bytes_sec(_pci.io_write_bytes_sec)}"]
                     y = self._draw_summary_row(
                         y, f"🎮AMD{g.index}",
-                        _as, _av_str, max_val=0,
-                        legend=_al, section="amd")
+                        _as, "", max_val=0, section="amd",
+                        values=_av)
             else:
                 y = self._draw_section_header(y, "amd", "AMD GPU (ROCm)", summary)
             self._current_section = "amd"
@@ -2188,12 +2280,11 @@ class HousekeeperGui:
             elif sm and "gaudi" not in se:
                 for d in gaudi_data:
                     gk = f"gaudi{d.index}"
-                    mem_str = f" {d.mem_used_pct:.0f}%" if d.mem_total_mib > 0 else ""
                     y = self._draw_summary_row(
                         y, f"🧮HL{d.index}",
                         [(f"{gk}_util", COLORS["gpu_util"])],
-                        f"{d.aip_util_pct:.0f}%{mem_str}", max_val=0,
-                        legend=["aip"], section="gaudi")
+                        "", max_val=0, section="gaudi",
+                        values=[f"aip:{d.aip_util_pct:.0f}%"])
             else:
                 y = self._draw_section_header(y, "gaudi", "Intel Gaudi", summary)
             self._current_section = "gaudi"
@@ -2390,7 +2481,7 @@ class HousekeeperGui:
             "Click RAID/Bond row    Show / Hide members",
             "Click  ?  button       Show this help",
             "",
-            "s                      Toggle summary mode",
+            "s                      Summary → Shrink → Full",
             "f                      Toggle °C / °F",
             "+  /  -                Change update interval",
             "q  /  Esc              Quit",

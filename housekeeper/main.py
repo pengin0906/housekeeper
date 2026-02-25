@@ -132,6 +132,7 @@ def _run_tui(stdscr: curses.window, args: argparse.Namespace) -> None:
     gpu_proc_col = None
     pcie_col = None
     nfs_col = None
+    conntrack_col = None
 
     if accel["nvidia"] and not args.no_gpu:
         GpuCollector = _lazy_import("housekeeper.collectors.gpu", "GpuCollector")
@@ -159,6 +160,14 @@ def _run_tui(stdscr: curses.window, args: argparse.Namespace) -> None:
         NfsMountCollector = _lazy_import("housekeeper.collectors.nfs", "NfsMountCollector")
         nfs_col = NfsMountCollector()
 
+    if sys.platform.startswith("linux"):
+        try:
+            _CT = _lazy_import("housekeeper.collectors.conntrack", "ConntrackCollector")
+            if _CT.available():
+                conntrack_col = _CT()
+        except Exception:
+            pass
+
     # 温度センサー (hwmon があれば常にロード)
     from housekeeper.collectors.temperature import TemperatureCollector
     temp_col = TemperatureCollector()
@@ -173,6 +182,8 @@ def _run_tui(stdscr: curses.window, args: argparse.Namespace) -> None:
         nfs_col.collect()
     if pcie_col:
         pcie_col.collect()
+    if conntrack_col:
+        conntrack_col.collect()
     time.sleep(0.1)
 
     show_pcie = True  # PCIe 表示トグル
@@ -193,6 +204,7 @@ def _run_tui(stdscr: curses.window, args: argparse.Namespace) -> None:
         gpu_proc_data = gpu_proc_col.collect() if gpu_proc_col else None
         pcie_data = pcie_col.collect() if pcie_col and show_pcie else None
         nfs_data = nfs_col.collect() if nfs_col else None
+        conntrack_data = conntrack_col.collect() if conntrack_col else None
         temp_data = temp_col.collect()
 
         # NFS マウントの動的検出 (10秒ごとにチェック)
@@ -273,7 +285,7 @@ def _collect_all(args: argparse.Namespace) -> dict:
     kern_col = KernelCollector()
 
     accel = _detect_accelerators()
-    nvidia_col = amd_col = gaudi_col = apple_col = gpu_proc_col = pcie_col = nfs_col = None
+    nvidia_col = amd_col = gaudi_col = apple_col = gpu_proc_col = pcie_col = nfs_col = conntrack_col = None
 
     if accel["nvidia"] and not args.no_gpu:
         nvidia_col = _lazy_import("housekeeper.collectors.gpu", "GpuCollector")()
@@ -288,6 +300,13 @@ def _collect_all(args: argparse.Namespace) -> dict:
         pcie_col = _lazy_import("housekeeper.collectors.pcie", "PcieCollector")()
     if _has_net_mounts():
         nfs_col = _lazy_import("housekeeper.collectors.nfs", "NfsMountCollector")()
+    if sys.platform.startswith("linux"):
+        try:
+            _CT = _lazy_import("housekeeper.collectors.conntrack", "ConntrackCollector")
+            if _CT.available():
+                conntrack_col = _CT()
+        except Exception:
+            pass
 
     from housekeeper.collectors.temperature import TemperatureCollector
     temp_col = TemperatureCollector()
@@ -297,6 +316,7 @@ def _collect_all(args: argparse.Namespace) -> dict:
     proc_col.collect(); kern_col.collect()
     if nfs_col: nfs_col.collect()
     if pcie_col: pcie_col.collect()
+    if conntrack_col: conntrack_col.collect()
     time.sleep(0.5)
 
     # 2回目
@@ -317,6 +337,7 @@ def _collect_all(args: argparse.Namespace) -> dict:
         "gpu_processes": gpu_proc_col.collect() if gpu_proc_col else None,
         "pcie_devices": pcie_col.collect() if pcie_col else None,
         "nfs_mounts": nfs_col.collect() if nfs_col else None,
+        "conntrack": conntrack_col.collect() if conntrack_col else None,
         "temperatures": temp_col.collect() or None,
     }
 
